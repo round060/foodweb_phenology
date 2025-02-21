@@ -1,0 +1,491 @@
+---
+title: "ZM Phyto Models"
+output: html_document
+date: "2024-02-02"
+---
+
+```{r package Setup, warning = F}
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(mnsentinellakes) #https://github.com/mnsentinellakes/mnsentinellakes
+library(mgcv)
+library(gratia)
+library(readxl)
+library(cowplot)
+library(wiqid)
+
+#Creates a figure directory
+dir.create(file.path("./figures"))
+
+select <- dplyr::select
+
+early.anomaly = -17.52
+late.anomaly = 14
+```
+
+# Read in semi cleaned data
+````{r load in}
+phytodata.cleanish <- read.csv("./data/ramsey_county_phytoplankton.csv")
+
+ice_off <- read.csv("./data/ice_off_summarized.csv") %>%
+  mutate(DNRID = fixlakeid(DOW)) %>% 
+  dplyr::select(DNRID, year, min_ice_off_julian, min_ice_off_date) %>%
+  dplyr::filter(DNRID == "82016700")
+
+mean_ice <- ice_off  %>%
+  dplyr::filter(year < 1980) %>%
+  summarise(mean_ice_off = mean(min_ice_off_julian))
+
+# Negative values indicate earlier anomalies
+wb.ice = ice_off %>%
+  add_row(data.frame(year = 2024, min_ice_off_julian = 67, min_ice_off_date = "2024-03-08")) %>%
+  mutate(ice_off_anomaly = min_ice_off_julian - mean_ice$mean_ice_off) %>% 
+  select(!DNRID) %>% 
+  filter(year > 1980)
+```
+
+
+```{r cleaning}
+temp <- merge( phytodata.cleanish, wb.ice, by = c("year")) %>% 
+  mutate(days_since_ice = JULIANDAY - min_ice_off_julian) %>%
+  mutate(ice_off_anomaly = as.numeric(ice_off_anomaly),
+         JULIANDAY = as.numeric(JULIANDAY),
+         year = as.numeric(year),
+         year_f = as.factor(year),
+         DNRID = as.factor(DNRID), 
+         ice_off_anomaly_abs = abs(ice_off_anomaly)) %>%
+  # Subjective but remove early (pre-february) and late (post Decemeber) dates
+  dplyr::filter(JULIANDAY > 60) %>%  
+  dplyr::filter(JULIANDAY < 330) %>%
+  mutate(ice_off_anomaly_s = scale(ice_off_anomaly),
+         JULIANDAY_s = scale(JULIANDAY))
+
+
+temp.long <- temp %>%
+  pivot_longer(ALL.CELLS:CHRYSOS, 
+               names_to = "phyto", values_to = "count") %>%
+  group_by(DNRID, year, phyto) %>%
+  ungroup() %>%
+  mutate(phyto = as.factor(phyto))
+```
+
+# Random stuff to use later
+```{r}
+early.anomaly_s <- standardize2match(-17.52, temp$ice_off_anomaly)
+late.anomaly_s <- standardize2match(14, temp$ice_off_anomaly)
+
+jd_sd <- sd(temp$JULIANDAY)
+jd_mean <- mean(temp$JULIANDAY)
+
+sd <- sd(temp$ice_off_anomaly)
+mean <- mean(temp$ice_off_anomaly)
+
+
+undo_jd <- function(x){
+  return(x*jd_sd + jd_mean)
+}
+```
+
+
+# Amount of data 
+```{r}
+hist(temp$year, breaks = 2023 - 1980)
+length(unique(temp$DNRID))
+
+total = temp %>% group_by(year, DNRID) %>% count()
+mean(total$n)
+```
+
+
+# Run all GAMS
+```{r}
+# loops through columns 5-11 in the data frame temp and runs nb GAMMs
+# TO DO - Play with offsets and counts 
+models <- list()
+
+
+for (i in 6:11) {
+  
+  single.model <- gam(temp[,i] ~ s(ice_off_anomaly_s) + s(JULIANDAY_s) + 
+                      s(ice_off_anomaly_s, JULIANDAY_s) +
+                      s(DNRID, bs = "re") + s(year_f, bs = "re"),
+                    method = "REML", select = T,
+                    data = temp, family = nb())
+  
+  print(paste0("Finished ", colnames(temp)[i]))
+  models[[paste0(colnames(temp)[i])]] <- single.model
+}
+
+# Could be worse, some zero stripes (esp with "less common" taxa)
+#appraise(models$CYANOS)
+#appraise(models$GREEN)
+#appraise(models$DIATOM)
+#draw(models$DIATOM)
+#draw(models$DINOS)
+#appraise(models$DINOS)
+#appraise(models$CRYPTOS)
+#appraise(models$CHRYSOS)
+
+
+#write_rds(models, "./models/phyto.models_s.rds")
+```
+
+# Read in model DF
+```{r}
+models <- read_rds("./models/phyto.models_s.rds")
+```
+
+
+# Plot DOY change
+```{r}
+start <- standardize2match(75, temp$JULIANDAY)
+end <- standardize2match(274, temp$JULIANDAY)
+
+
+hist(temp$JULIANDAY) # Approx 125-275 for peak sampling, look at 100 - 300
+quantile(temp$JULIANDAY_s, c(0.05, 0.95))
+hist(temp$ice_off_anomaly, breaks = 20)
+quantile(temp$ice_off_anomaly)
+
+plot.phyto.doy = function(model = NA, var.name = NA, type = "plot", slice = 1, y.label = NA, 
+                         early.anomaly_s = -0.9348572, late.anomaly_s = 1.579282, 
+                         start.date_s = start, end.date_s = end) {
+  
+  model <- models[[var.name]]
+  # Year and DNRID aren't used but are required for predict.gam
+  length <- length(seq(90, 274, by = 1))
+  pred.df <- data.frame(
+                        ice_off_anomaly_s = c(rep(early.anomaly_s, length), rep(0, length), 
+                                            rep(late.anomaly_s, length)),
+                        ice_off_anomaly = c(rep(-17.52, length), rep(0, length), 
+                                            rep(14, length)),
+                        JULIANDAY_s = seq(start.date_s, end.date_s, length.out = length),
+                        JULIANDAY = seq(90, 274),
+                        DNRID = "62001200", year_f = "1981") 
+  
+  fit <- predict.gam(model, pred.df,
+                     unconditional = T, # Gives simultaneous
+                     type = "response",
+                     exclude = c('s(DNRID)', 
+                                's(year_f)'),
+                     se.fit = T)
+  pred.df$predictions = fit$fit
+  pred.df$se = fit$se.fit
+  
+  y.label <- species.labels %>% filter(variable == var.name) %>% 
+      dplyr::select(axis.label) %>% as.character()
+  
+  pred.df %>%
+    mutate(ice_off_anomaly = as.factor(ice_off_anomaly_s),
+           ice_off_descriptor = ifelse(ice_off_anomaly_s == early.anomaly_s, 
+                                       "Early", "Normal"),
+           ice_off_descriptor = ifelse(ice_off_anomaly_s == late.anomaly_s, 
+                                       "Late", ice_off_descriptor)) %>%
+    ggplot(aes(y = predictions, x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+               color = ice_off_anomaly)) +
+    geom_line(aes(y = predictions, x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+                  color = ice_off_descriptor), lwd = 2) +
+    theme_classic() +
+    scale_x_date(date_breaks = "months" , date_labels = "%b") + 
+    labs(y = paste0(y.label), x = "Julian Day", 
+         color = "Ice-Off \nAnomaly", fill = "Ice-Off \nAnomaly") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16))
+}
+species.labels <- data.frame(variable = names(models), 
+           axis.label = c("Cyanobacteria\nDensity", 
+                          "Green-algae\nDensity", "Diatoms\nDensity", 
+                          "Dinoflagellates\nDensity", "Cryptomonads\nDensity", 
+                          "Chrysophytes\nDensity"))
+
+cyanos.doy <- plot.phyto.doy(var.name = "CYANOS") + theme(legend.position="none")
+green.doy <- plot.phyto.doy(var.name = "GREEN") + theme(legend.position="none")
+diatom.doy <- plot.phyto.doy(var.name = "DIATOM") + theme(legend.position="none")
+dinos.doy <- plot.phyto.doy(var.name = "DINOS") + theme(legend.position="none")
+cryptos.doy <- plot.phyto.doy(var.name = "CRYPTOS") + theme(legend.position="none")
+chrysos.doy <- plot.phyto.doy(var.name = "CHRYSOS")  + 
+  theme(legend.position = c(0.75, 0.75))
+
+phyto <- plot_grid(cyanos.doy, green.doy, diatom.doy,
+                            dinos.doy, cryptos.doy, chrysos.doy)
+
+title <- ggdraw() + 
+  draw_label(
+    "Effects of Anomalous Ice-Off on Phytoplankton Concentrations Over the Year",
+    fontface = 'bold', size = 23, x = 0, hjust = 0) +
+  theme(
+    plot.margin = margin(0, 0, 0, 7))
+
+plot_grid(
+  #title, 
+  phyto,
+  ncol = 1, rel_heights = c(0.1, 1)
+)
+ggsave("./figures/FigureS6.jpeg", height = 10, width = 12)
+```
+
+
+# Peak timing
+```{r}
+toy.df <- data.frame(ice_off_anomaly_s = c(rep(early.anomaly_s, 221), rep(0, 221), 
+                                          rep(late.anomaly_s, 221)),
+                      JULIANDAY_s = seq(start, end, length.out = 221), 
+                      DNRID = "82016700", year_f = "2000") %>%
+    mutate(row = row_number()) %>% 
+    mutate(ice_off_f =  ifelse(ice_off_anomaly_s == early.anomaly_s, "Early", "Normal"),
+           ice_off_f =  ifelse(ice_off_anomaly_s == late.anomaly_s, "Late", ice_off_f),
+           ice_off_f =  ifelse(ice_off_anomaly_s == 0, "Average", ice_off_f))
+
+
+iters <- names(models)
+
+timing.cis <- data.frame(group = character(0), 
+                   numeric = numeric(0),
+                   timing = character(0),
+                   median = numeric(0),
+                   lower.95 = numeric(0),
+                   upper.95 = numeric(0),
+                   lower.75 = numeric(0),
+                   upper.75 = numeric(0))
+
+pred.df = toy.df
+
+for (i in 1:length(iters)) {
+  model = models[[iters[i]]]
+  
+  # Use posterior dist of the mean to get posterior fitted values
+  sims <- fitted_samples(model, exclude = c('s(DNRID)',  's(year_f)'),
+                         newdata = pred.df, n = 1000, seed = 1024) |>
+  left_join(pred.df |> select(row, ice_off_anomaly_s, JULIANDAY_s, ice_off_f), 
+            by = join_by(row == row))
+  
+  if (iters[i] %in% c("GREEN", "DIATOM", "CRYPTOS", "CHRYSOS")) {
+    sims = sims %>% filter(JULIANDAY_s < -0.2974567)
+  }
+  
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  early <- sims %>% filter(ice_off_anomaly_s == early.anomaly_s) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  early.quant <- quantile(early$JULIANDAY_s, probs = c(.025,.975))
+  early.quant.75 <- quantile(early$JULIANDAY_s, probs = c(.125, .875))
+  early.median <- median(early$JULIANDAY_s)
+
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  late <- sims %>% filter(ice_off_anomaly_s == late.anomaly_s) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  late.quant <- quantile(late$JULIANDAY_s, probs = c(.025,.975))
+  late.quant.75 <- quantile(late$JULIANDAY_s, probs = c(.125, .875))
+  late.median <- median(late$JULIANDAY_s)
+  
+  average <- sims %>% filter(ice_off_anomaly_s == 0) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  average.quant <- quantile(average$JULIANDAY_s, probs = c(.025,.975))
+  average.quant.75 <- quantile(average$JULIANDAY_s, probs = c(.125, .875))
+  average.median <- median(average$JULIANDAY_s)
+  
+  # Get the difference between peak timings
+  diff.early <- early$JULIANDAY_s - average$JULIANDAY_s
+  diff.earlymedian <- median(diff.early)
+  diff.earlyquant <- quantile(diff.early, probs = c(.025,.975))
+  diff.earlyquant.75 <- quantile(diff.early, probs = c(.125, .875))
+  
+  diff.late <- late$JULIANDAY_s - average$JULIANDAY_s
+  diff.latemedian <- median(diff.late)
+  diff.latequant <- quantile(diff.late, probs = c(.025,.975))
+  diff.latequant.75 <- quantile(diff.late, probs = c(.125, .875))
+
+  # Make new data frame to rbind to big data frame
+  df <- data.frame(group = iters[[i]], 
+                   numeric = i,
+                   timing = c("Early", "Late", "Average", 
+                              "Early Difference", "Late Difference"),
+                   median = c(early.median, late.median, average.median, 
+                              diff.earlymedian, diff.latemedian),
+                   lower.95 = c(early.quant[1], late.quant[1], average.quant[1], 
+                                diff.earlyquant[1], diff.latequant[1]),
+                   upper.95 = c(early.quant[2], late.quant[2], average.quant[2],
+                                diff.earlyquant[2], diff.latequant[2]),
+                   lower.75 = c(early.quant.75[1], late.quant.75[1], average.quant.75[1],
+                                diff.earlyquant.75[1], diff.latequant.75[1]),
+                   upper.75 = c(early.quant.75[2], late.quant.75[2], average.quant.75[2],
+                                diff.earlyquant.75[2], diff.latequant.75[2]))
+  
+  timing.cis <- rbind(timing.cis, df)
+  pred.df = toy.df
+}
+
+row.names(timing.cis) <- NULL
+
+
+species.labels <- data.frame(variable = names(models), 
+  axis.label = c("Cyanobacteria", 
+                          "Green-algae", "Diatom", 
+                          "Dinoflagellate", "Cryptomonad", 
+                          "Chrysophyte"))
+
+timing.cis.plot <- timing.cis %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit)) %>%
+  merge(y = species.labels, by.x = "group", by.y = "variable") %>%
+  mutate(axis.label = factor(axis.label, 
+                             levels = c("Cyanobacteria", 
+                          "Green-algae", "Diatom", 
+                          "Dinoflagellate", "Cryptomonad", 
+                          "Chrysophyte")))
+
+timing.cis.plot$timing <- factor(timing.cis.plot$timing, 
+                                 levels = c("Early", "Average", "Late", 
+                                            "Early Difference", "Late Difference"))
+
+
+timing.cis.plot %>%
+  filter(!grepl("Difference", timing)) %>%
+  mutate(across(median:upper.75, undo_jd)) %>%
+  ggplot() + 
+  geom_point(aes(x = as.Date(median, origin = as.Date("2018-01-01")), y = -1*(numeric + jit), 
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.95, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.95, origin = as.Date("2018-01-01")), color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.75, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.75, origin = as.Date("2018-01-01")), color = timing), linewidth = 1.5) +
+  #facet_grid(group ~., switch = "y") +
+  theme_classic() +
+  labs(y = "",
+       x = "Day Peak Density Occurs", color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#FF0000", "#000000", "#0000FF")) +
+  scale_y_continuous(breaks = -1:-6, labels = levels(timing.cis.plot$axis.label)) +
+  scale_x_date(date_labels = "%b")
+  #scale_x_continuous(breaks = seq(100, 275, by = 25))
+
+# Figure S1
+ggsave("./figures/FigureS1.jpeg", height = 8, width = 8)
+
+
+timing.cis.plot <- timing.cis.plot %>% 
+  mutate(across(median:upper.75, 
+                ~ if_else(row_number() %in% grep("Difference", timing), .*jd_sd, undo_jd(.))))
+
+
+write.csv(timing.cis.plot, "./data/phyto_modeled_peak.csv", row.names = F)
+```
+
+
+
+#### Graveyard - Not used in paper ###
+# I dont think it zeroes out REs
+```{r}
+ds <- data_slice(models$CYANOS, var1 = "ice_off_anomaly_s")
+fv <- fitted_values(models$CYANOS, data = ds)
+  
+fv |>
+  ggplot(aes(x = ice_off_anomaly_s, y = fitted)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.2) +
+  geom_line() + 
+  ylim(0, max(fv$upper))
+```
+
+
+# DOY change function - BAYESIAN
+```{r}
+start <- standardize2match(75, temp$JULIANDAY)
+end <- standardize2match(274, temp$JULIANDAY)
+
+plot.phyto.doy.bayes = function(model = NA, var.name = NA, slice = 1, y.label = NA, 
+                         early.anomaly_s = -0.9348572, late.anomaly_s = 1.579282, 
+                         start.date_s = start, end.date_s = end) {
+  if (is.na(model)) {
+    model <- models[[var.name]]
+  }
+  # Year and DNRID aren't used but are required for predict.gam
+  length <- length(seq(90, 274, by = 1))
+  pred.df <- data.frame(ice_off_anomaly_s = c(rep(early.anomaly_s, length), rep(0, length), 
+                                            rep(late.anomaly_s, length)),
+                        ice_off_anomaly = c(rep(-17.52, length), rep(0, length), 
+                                            rep(14, length)),
+                        JULIANDAY_s = seq(start.date_s, end.date_s, length.out = length),
+                        JULIANDAY = seq(90, 274),
+                        DNRID = "62001200", year_f = "1981") %>%
+    mutate(row = row_number()) %>% 
+    mutate(
+           ice_off_f =  ifelse(ice_off_anomaly_s == early.anomaly_s, "Early", "Normal"),
+           ice_off_f =  ifelse(ice_off_anomaly_s == late.anomaly_s, "Late", ice_off_f))
+
+  fv <- fitted_values(model, data = pred.df, exclude = c('s(DNRID)',  's(year_f)'))
+  fs <- fitted_samples(model, data = pred.df, n = 20, seed = 1024,
+                       exclude = c('s(DNRID)',  's(year_f)')) |>
+    left_join(pred.df |> select(row, ice_off_anomaly_s, JULIANDAY_s), 
+              by = join_by(row == row)) %>%
+    drop_na()
+  fit <- predict.gam(model, pred.df,
+                     unconditional = T, # Gives simultaneous
+                     type = "response",
+                     exclude = c('s(DNRID)', 
+                                's(year_f)'),
+                     se.fit = T)
+  pred.df$predictions = fit$fit
+  pred.df$se = fit$se.fit
+  
+  y.label <- species.labels %>% filter(variable == var.name) %>% 
+        select(axis.label) %>% as.character()
+  plot <- ggplot() +
+      geom_line(data = pred.df, aes(y = predictions, 
+                    x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+                    color = ice_off_f), lwd = 2) +
+      geom_ribbon(data = fv, 
+                  aes(x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")),
+                      y = fitted, ymin = lower, ymax = upper, 
+                      fill = ice_off_f), alpha = 0.3) +
+      theme_classic() +
+      scale_x_date(date_breaks = "months" , date_labels = "%b") + 
+      labs(y = paste0(y.label), x = "Julian Day", 
+           color = "Ice-Off", fill = "Ice-Off") +
+      theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 16))
+    
+  return(plot)
+}
+```
+
+
+# Plot DOY change - Bayesian
+```{r}
+species.labels <- data.frame(variable = names(models), 
+           axis.label = c("Cyanobacteria\nDensity", 
+                          "Green-algae\nDensity", "Diatoms\nDensity", 
+                          "Dinoflagellates\nDensity", "Cryptomonads\nDensity", 
+                          "Chrysophytes\nDensity"))
+
+cyanos.doy <- plot.phyto.doy.bayes(var.name = "CYANOS") + theme(legend.position= c(.3, .8))
+green.doy <- plot.phyto.doy.bayes(var.name = "GREEN") + theme(legend.position="none")
+diatom.doy <- plot.phyto.doy.bayes(var.name = "DIATOM") + theme(legend.position="none")
+dinos.doy <- plot.phyto.doy.bayes(var.name = "DINOS") + theme(legend.position="none")
+cryptos.doy <- plot.phyto.doy.bayes(var.name = "CRYPTOS") + theme(legend.position="none")
+chrysos.doy <- plot.phyto.doy.bayes(var.name = "CHRYSOS") + theme(legend.position="none")
+
+
+phyto <- plot_grid(cyanos.doy, green.doy, diatom.doy,
+                            dinos.doy, cryptos.doy, chrysos.doy)
+
+plot_grid(
+  phyto,
+  ncol = 1, rel_heights = c(0.1, 1)
+)
+```
+

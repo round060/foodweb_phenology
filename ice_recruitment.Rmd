@@ -1,0 +1,461 @@
+---
+title: "Recruitment_ice"
+author: "Chris R"
+date: "4/17/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(sf)
+library(mgcv)
+library(arrow)
+library(gratia)
+
+early.anomaly = -17.52
+late.anomaly = 14
+
+# 69037800 Ver - Bad data prior to 2018
+# 25000100 Pepin - missing data
+surveys_ef <- read.csv("./data/yoy_data.csv")
+ice_off <- read.csv("./data/ice_off_summarized.csv")
+
+
+# 77021500, 27013700, 81001400 - No EF surveys
+long_term <- ice_off %>% group_by(DOW) %>% count() %>% filter(n >= 100) %>% 
+  filter(!DOW %in% c("27013700", "81001400")) # Lakes without EF surveys
+
+# Calulate average ice off long term
+average <- ice_off %>% dplyr::filter(DOW %in% long_term$DOW) %>% 
+  filter(year < 1980) %>%
+  group_by(DOW) %>% summarise(mean_ice_off = mean(min_ice_off_julian))
+
+anomaly <- average %>% merge(ice_off, by = "DOW") %>% filter(year > 1980) %>%
+  mutate(anomaly =  min_ice_off_julian - mean_ice_off) %>%
+  group_by(year) %>%
+  summarize(average_anomaly = mean(anomaly), 
+            sd_anomaly = sd(anomaly))
+```
+
+
+
+```{r}
+plot(y = anomaly$average_anomaly, x = anomaly$year)
+mean(anomaly$average_anomaly)
+
+efish_wae_ice <- surveys_ef %>%
+  dplyr::select(year, lake_id, catch, total_effort_1, x, y, acres, julian_day_survey, FRY, fry.pa) %>%
+  rename(DOW = lake_id) %>%
+  mutate(log_acres = log(acres),
+         cpue = catch/total_effort_1)
+  
+  
+efish_ice_anomaly <- merge(efish_wae_ice, anomaly, by = c("year")) %>%
+  mutate(DOW = as.factor(DOW),
+         year_f = as.factor(year),
+         average_anomaly_abs = abs(average_anomaly))
+
+five.years <- efish_ice_anomaly %>% group_by(DOW) %>% count() %>% dplyr::filter(n >= 3)
+efish_ice <- efish_ice_anomaly %>% dplyr::filter(DOW %in% five.years$DOW)
+```
+
+
+# Survey Info
+```{r}
+length(unique(efish_ice$DOW))
+min(efish_ice$year);max(efish_ice$year)
+
+lakes = efish_ice %>% group_by(DOW) %>% count()
+
+median(lakes$n) # Median surveys per lake = 8.5
+
+num.per.year = efish_ice %>% group_by(year) %>% count() %>% ungroup() 
+mean(num.per.year$n)
+```
+
+
+# Wae recruitment ICE
+## Uses non lake specific ice off anomalys (only year specific)
+
+### OPTIMIZED
+```{r}
+gam.ice <- gam(catch ~ s(average_anomaly) + s(log_acres) + s(x, y) + s(julian_day_survey) +
+                 s(DOW, bs = "re") + s(year_f, bs = "re") + offset(log(total_effort_1)), 
+               method = "REML", select = T,
+               family = nb(),
+               data = efish_ice)
+#write_rds(gam.ice, "./models/yoy_ice_gam.rds")
+#gam.ice <- readRDS("./models/yoy_ice_gam.rds")
+appraise(gam.ice)
+gratia::draw(gam.ice)
+summary(gam.ice) # 41.1 % deviance explained
+
+k.check(gam.ice)
+
+
+sm <- smooth_estimates(gam.ice)
+jd_smooth <- sm %>%
+  filter(smooth == "s(average_anomaly)" ) %>%
+  add_confint() %>%
+  add_constant(coef(gam.ice)["(Intercept)"]) %>% 
+  mutate(upper_ci = upper_ci + coef(gam.ice)["(Intercept)"],
+         lower_ci = lower_ci + coef(gam.ice)["(Intercept)"]) %>%
+  #mutate(upper_ci = gam.ice$family$linkinv(upper_ci),
+  #       lower_ci = gam.ice$family$linkinv(lower_ci)) %>%
+  transform_fun(inv_link(gam.ice))
+  
+
+efish_ice_residuals <- efish_ice %>% add_partial_residuals(gam.ice) %>%
+  add_constant(coef(gam.ice)["(Intercept)"], column = 17) %>%
+  transform_fun(inv_link(gam.ice), 17)
+
+jd_smooth %>%
+  ggplot(aes(x = average_anomaly, y = est)) +
+  geom_point(aes(x = average_anomaly, y = `s(average_anomaly)`), 
+             alpha = 0.2, data = efish_ice_residuals) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.2) + 
+  labs(y = "Fall Age-0 Walleye Catch", x = "Ice-Off Anomaly") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 55)) + 
+  #ggtitle("Effects of Anomalous Ice-Off on Walleye Recruitment") + 
+  theme_classic() +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        plot.title = element_text(size = 23, hjust = 0.5, face = "bold"))
+  
+ggsave("./figures/figure3.jpeg", height = 10, width = 12)
+```
+
+
+
+# Fitted samples plot
+```{r}
+efish_ice %>% select(total_effort_1, log_acres, julian_day_survey, x, y) %>%
+  summarize(across(c(total_effort_1, log_acres, julian_day_survey, x, y), 
+      ~ mean(.x, na.rm = TRUE)))
+
+pred.df = data.frame(
+  average_anomaly = seq(-18, 16, by = 0.5),
+  x = -94.7, y = 46.1,
+  julian_day_survey = 266, log_acres = 7.5,
+  DOW = "56074701", year_f = 2011, total_effort_1 = 1.4) %>%
+  mutate(row = row_number())
+
+fs <- fitted_samples(gam.ice, data = pred.df, n = 1000, seed = 1024,
+                       exclude = c('s(DOW)',  's(year_f)')) |>
+    left_join(pred.df |> select(row, average_anomaly), 
+              by = join_by(row == row)) %>%
+  mutate(group = as.numeric(draw))
+
+fv <- fitted_values(gam.ice, data = pred.df, exclude = c('s(DOW)',  's(year_f)'))
+
+fig <- fs %>%
+  ggplot() +
+  geom_line(data = fv, aes(x = average_anomaly, y = fitted), size = 1.5) + 
+  geom_line(aes(x = average_anomaly, y = fitted, group = group), alpha = 0.01) + 
+  labs(x ="Ice-off Anomaly", y = "Fall Age-0 Walleye Catch") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) + 
+  scale_x_continuous(breaks = c(-15, -10, -5, 0, 5, 10, 15))  + 
+  theme(plot.margin=grid::unit(c(0,0,0,25), "mm"))
+fig
+#write_rds(fig, "./figures/fig3B.rds")
+# Figure 3B
+#ggsave("./figures/Figure3B.jpeg", width = 10, height = 10)
+```
+
+
+# Get estimates of decrease in year-class
+```{r}
+data_to_predict <- efish_ice %>% 
+  select(average_anomaly, log_acres, x, y, julian_day_survey, total_effort_1, acres) %>%
+  summarize(across(everything(), ~median(.x, na.rm = T)))
+
+df.results <- data.frame(average = numeric(0), low = numeric(0), high = numeric(0), 
+                         age = numeric(0))
+
+rmvn <- function(n, mu, sig) { ## MVN random deviates 
+    L <- mroot(sig);
+    m <- ncol(L); 
+    t(mu + L%*%matrix(rnorm(m * n), m, n)) 
+} 
+newd <- data.frame(average_anomaly = c(-17.52, 0, 14), log_acres = log(data_to_predict$acres),
+                     x = data_to_predict$x, y = data_to_predict$y, 
+                     julian_day_survey = data_to_predict$julian_day_survey, total_effort_1 = data_to_predict$total_effort_1, 
+                     DOW = "10005900", year_f = 2010)
+  
+predicted = predict(gam.ice, newd, type = "response", 
+                exclude = c("s(DOW)", "s(year_f)"))
+  
+Xp <- predict(gam.ice, newd, type = "lpmatrix", 
+                exclude = c("s(DOW)", "s(year_f)") )
+  
+  
+br <- rmvn(1000, coef(gam.ice), gam.ice$Vp) ## 1000 replicate param. vectors 
+  
+early.ice.off <- rep(0, 1000)
+normal.ice.off <- rep(0, 1000)
+late.ice.off <- rep(0, 1000)
+percent.early.normal <- rep(0, 1000)
+percent.early.late <- rep(0, 1000)
+diff.early.normal <- rep(0,1000)
+diff.early.late <- rep(0,1000)
+
+  
+for (i in 1:1000) { 
+  pr <- Xp %*% br[i,] ## replicate predictions 
+  early.ice.off[i] = exp(pr[1,])
+  normal.ice.off[i] =  exp(pr[2,]) 
+  late.ice.off[i] =  exp(pr[3,])
+  percent.early.normal[i] = 1 - (early.ice.off[i]/normal.ice.off[i])
+  percent.early.late[i] = 1 - (early.ice.off[i]/late.ice.off[i])
+  diff.early.normal[i] <- early.ice.off[i] - normal.ice.off[i]
+  diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
+} 
+  
+median(early.ice.off)
+quantile(early.ice.off, na.rm = T, probs = c(0.025, 0.975))
+         
+         
+median(normal.ice.off) 
+quantile(normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
+
+median(late.ice.off)
+quantile(late.ice.off, na.rm = T, probs = c(0.025, 0.975))
+                                 
+# Percent decrease in recruitment from early to normal ice-off (pos = increase)
+median(percent.early.normal)*100
+quantile(percent.early.normal, na.rm = T, probs = c(0.025, 0.975))*100
+
+
+# Percent decrease in recruitment from early to late ice-off (pos = increase)
+median(percent.early.late)*100
+quantile(percent.early.late, na.rm = T, probs = c(0.025, 0.975))*100
+
+                                 
+median(1 - (early.ice.off/late.ice.off), na.rm = T)*100
+quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025, 0.975))*100
+                                 
+median(early.ice.off - normal.ice.off, na.rm = T) /1.09
+quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
+                                 
+median(early.ice.off - late.ice.off, na.rm = T)/1.09
+quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.025, 0.975))
+
+```
+
+
+# Supplement
+# WAE recruitment lake specific
+```{r}
+pre_1980 <- ice_off %>% filter(year < 1981) %>%
+  group_by(DOW) %>% count() %>% filter( n > 4)
+
+
+average <- ice_off %>% 
+  filter(DOW %in% pre_1980$DOW) %>% 
+  filter(year < 1980) %>%
+  group_by(DOW) %>% summarise(mean_ice_off = mean(min_ice_off_julian))
+
+lake_specific_anomaly <- average %>% merge(ice_off, by = "DOW") %>% filter(year > 1980) %>%
+  mutate(anomaly =  min_ice_off_julian - mean_ice_off) %>%
+  select(DOW, mean_ice_off, year, anomaly)
+
+
+
+efish_wae_ice_lake_specific <- surveys_ef %>%
+  dplyr::select(year, lake_id, catch, total_effort_1, x, y, acres, julian_day_survey) %>%
+  mutate(DOW = lake_id) %>%
+  mutate(log_acres = log(acres),
+    cpue = catch/total_effort_1) %>%
+  mutate(DOW = ifelse(DOW == 73020002, 73020000, DOW),
+         DOW = ifelse(DOW == 73019600, 73020000, DOW), 
+         DOW = ifelse(DOW == 51006300, 51004600, DOW)
+         ) %>%
+  merge(lake_specific_anomaly, by = c("year", "DOW")) %>%
+  mutate(DOW = as.factor(DOW),
+         year_f = as.factor(year),
+         anomaly_abs = abs(anomaly))
+
+lake_specific_lakes <- efish_wae_ice_lake_specific %>% group_by(DOW) %>% 
+  count() %>% 
+  filter(n > 2)
+
+lake_specific <- efish_wae_ice_lake_specific %>% filter(DOW %in% lake_specific_lakes$DOW)
+
+# Number of lakes
+length(unique(lake_specific$DOW))
+range(lake_specific$year)
+```
+
+
+# Create model for walleye recruitment lake specific
+```{r}
+gam.ice.lake.specific <- gam(catch ~ s(anomaly) + s(log_acres)  + s(julian_day_survey) +
+                               s(x, y) +
+                 s(lake_id, bs = "re") + offset(log(total_effort_1)), 
+               method = "REML",
+               family = nb(),
+               data = lake_specific)
+#saveRDS(gam.ice.lake.specific, "./models/yoy_ice_gam_lake_specific.rds")
+#gam.ice.lake.specific <- readRDS("./models/yoy_ice_gam_lake_specific.rds")
+
+
+appraise(gam.ice.lake.specific)
+gratia::draw(gam.ice.lake.specific)
+summary(gam.ice.lake.specific)
+k.check(gam.ice.lake.specific)
+
+
+sm <- smooth_estimates(gam.ice.lake.specific)
+jd_smooth <- sm %>%
+  filter(smooth == "s(anomaly)" ) %>%
+  add_confint() %>%
+  add_constant(coef(gam.ice.lake.specific)["(Intercept)"]) %>% 
+  mutate(upper_ci = upper_ci + coef(gam.ice.lake.specific)["(Intercept)"],
+         lower_ci = lower_ci + coef(gam.ice.lake.specific)["(Intercept)"]) %>%
+  mutate(upper_ci = gam.ice.lake.specific$family$linkinv(upper_ci),
+         lower_ci = gam.ice.lake.specific$family$linkinv(lower_ci)) %>%
+  transform_fun(inv_link(gam.ice.lake.specific))
+  
+
+efish_ice_residuals <- lake_specific %>% add_partial_residuals(gam.ice.lake.specific) %>%
+  add_constant(coef(gam.ice.lake.specific)["(Intercept)"], column = 16) %>%
+  transform_fun(inv_link(gam.ice.lake.specific), 16)
+
+jd_smooth %>%
+  ggplot(aes(x = anomaly, y = est)) +
+  geom_point(aes(x = anomaly, y = `s(anomaly)`), 
+             alpha = 0.2, data = efish_ice_residuals) +
+  geom_line(lwd = 1.5) +
+  geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.2) + 
+  labs(y = "Fall Age-0 Walleye Catch", x = "Ice-Off Anomaly") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 85)) + 
+  #ggtitle("Effects of Anomalous Ice-Off on Walleye Recruitment") + 
+  theme_classic() +
+  theme(axis.text = element_text(size = 14),
+        axis.title = element_text(size = 18),
+        plot.title = element_text(size = 23, hjust = 0.5, face = "bold"))
+
+# Figure S3
+ggsave("./figures/FigureS3.jpeg", height = 10, width = 12)
+```
+
+
+# Get estimates of decrease in recruitment with lake specific ice anomalies
+```{r}
+data_to_predict <- lake_specific %>% 
+  select(anomaly, log_acres, x, y, julian_day_survey, total_effort_1, acres) %>%
+  summarize(across(everything(), ~median(.x, na.rm = T)))
+
+df.results <- data.frame(average = numeric(0), low = numeric(0), high = numeric(0), 
+                         age = numeric(0))
+
+rmvn <- function(n, mu, sig) { ## MVN random deviates 
+    L <- mroot(sig);
+    m <- ncol(L); 
+    t(mu + L%*%matrix(rnorm(m * n), m, n)) 
+} 
+newd <- data.frame(average_anomaly = c(-17.52, 0, 14), log_acres = log(data_to_predict$acres),
+                     x = data_to_predict$x, y = data_to_predict$y, 
+                     julian_day_survey = data_to_predict$julian_day_survey, total_effort_1 = data_to_predict$total_effort_1, 
+                     DOW = "10005900", year_f = 2010)
+  
+predicted = predict(gam.ice, newd, type = "response", 
+                exclude = c("s(DOW)", "s(year_f)"))
+  
+Xp <- predict(gam.ice, newd, type = "lpmatrix", 
+                exclude = c("s(DOW)", "s(year_f)") )
+  
+  
+br <- rmvn(1000, coef(gam.ice), gam.ice$Vp) ## 1000 replicate param. vectors 
+  
+early.ice.off <- rep(0, 1000)
+normal.ice.off <- rep(0, 1000)
+late.ice.off <- rep(0, 1000)
+percent.early.normal <- rep(0, 1000)
+percent.early.late <- rep(0, 1000)
+diff.early.normal <- rep(0,1000)
+diff.early.late <- rep(0,1000)
+
+  
+for (i in 1:1000) { 
+  pr <- Xp %*% br[i,] ## replicate predictions 
+  early.ice.off[i] = exp(pr[1,])
+  normal.ice.off[i] =  exp(pr[2,]) 
+  late.ice.off[i] =  exp(pr[3,])
+  percent.early.normal[i] = 1 - (early.ice.off[i]/normal.ice.off[i])
+  percent.early.late[i] = 1 - (early.ice.off[i]/late.ice.off[i])
+  diff.early.normal[i] <- early.ice.off[i] - normal.ice.off[i]
+  diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
+} 
+  
+median(early.ice.off)
+quantile(early.ice.off, na.rm = T, probs = c(0.025, 0.975))
+         
+         
+median(normal.ice.off) 
+quantile(normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
+
+median(late.ice.off)
+quantile(late.ice.off, na.rm = T, probs = c(0.025, 0.975))
+                                 
+median(1 - (early.ice.off/normal.ice.off), na.rm = T)*100
+quantile(1 - (early.ice.off/normal.ice.off), na.rm = T, probs = c(0.025, 0.975))*100
+                                 
+median(1 - (early.ice.off/late.ice.off), na.rm = T)*100
+quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025, 0.975))*100
+
+
+# Percent decrease in recruitment from early to normal ice-off (pos = increase)
+median(percent.early.normal)*100
+quantile(percent.early.normal, na.rm = T, probs = c(0.025, 0.975))*100
+
+
+# Percent decrease in recruitment from early to late ice-off (pos = increase)
+median(percent.early.late)*100
+quantile(percent.early.late, na.rm = T, probs = c(0.025, 0.975))*100
+
+                                 
+median(early.ice.off - normal.ice.off, na.rm = T) /1.09
+quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
+                                 
+median(early.ice.off - late.ice.off, na.rm = T)/1.09
+quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.025, 0.975))
+
+```
+
+
+# Graveyard
+# Model with stocked walleye effect
+```{r}
+efish_ice_stocked <- efish_ice_anomaly %>% 
+  dplyr::filter(DOW %in% five.years$DOW) %>% 
+  mutate(fry_stocked = as.factor(ifelse(FRY > 0, 1, 0)))
+
+
+gam.ice_stocked <- gam(catch ~ s(average_anomaly, by = fry_stocked) + s(log_acres) + 
+                 s(x, y) + s(julian_day_survey) +
+                 s(DOW, bs = "re") + s(year_f, bs = "re") + 
+                 offset(log(total_effort_1)), 
+               method = "REML", select = T,
+               family = nb(),
+               data = efish_ice_stocked)
+
+#write_rds(gam.ice, "./models/yoy_ice_gam.rds")
+#gam.ice <- readRDS("./models/yoy_ice_gam.rds")
+appraise(gam.ice_stocked)
+gratia::draw(gam.ice_stocked, select = c(1, 2))
+#ggsave("./figures/fry_stocking_effect.jpeg")
+summary(gam.ice_stocked)
+
+k.check(gam.ice_stocked)
+```
+
+
+

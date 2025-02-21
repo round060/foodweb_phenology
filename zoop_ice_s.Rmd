@@ -1,0 +1,913 @@
+---
+title: "zooplankton_ice"
+author: "Christopher Rounds"
+date: "2/1/2024"
+output: html_document
+---
+
+```{r setup}
+library(tidyverse)
+library(mnsentinellakes) #https://github.com/mnsentinellakes/mnsentinellakes
+library(mgcv)
+library(gratia)
+library(cowplot)
+library(wiqid)
+options(scipen = 999)
+
+# Creates a figure directory
+dir.create(file.path("./figures"))
+
+select <- dplyr::select
+
+zoop <- read.csv("./data/ramsey_county_zooplankton.csv") %>%
+  rename(year = YEAR)
+
+# These are calulated from all of white bear ice data (not just post-1980)
+early.anomaly = -17.52
+late.anomaly = 14
+```
+
+
+
+
+# Combine ice data with zooplankton data
+## Use ice data only from White Bear (DOW = 82016700)
+```{r}
+ice_off <- read.csv("./data/ice_off_summarized.csv") %>%
+  mutate(DNRID = fixlakeid(DOW)) %>% 
+  dplyr::select(DNRID, year, min_ice_off_julian, min_ice_off_date) %>%
+  dplyr::filter(DNRID == "82016700")
+
+
+mean_ice <- ice_off  %>%
+  dplyr::filter(year < 1980) %>%
+  summarise(mean_ice_off = mean(min_ice_off_julian))
+
+# Negative values indicate earlier anomalies
+wb.ice = ice_off %>%
+  add_row(data.frame(year = 2024, min_ice_off_julian = 67, min_ice_off_date = "2024-03-08")) %>%
+  mutate(ice_off_anomaly = min_ice_off_julian - mean_ice$mean_ice_off) %>% 
+  select(!DNRID) %>% 
+  filter(year > 1980)
+
+temp <- merge(wb.ice, zoop, by = c("year")) %>% 
+  mutate(days_since_ice = JULIANDAY - min_ice_off_julian) %>%
+  dplyr::filter(!is.na(CYCLO.THOUS.M3)) %>%
+  mutate(ice_off_anomaly = as.numeric(ice_off_anomaly),
+         JULIANDAY = as.numeric(JULIANDAY),
+         year = as.numeric(year),
+         year_f = as.factor(year),
+         DNRID = as.factor(DNRID), 
+         ice_off_anomaly_abs = abs(ice_off_anomaly)) %>%
+  # Subjective but remove early (pre-february) and late (post Decemeber) dates
+  dplyr::filter(JULIANDAY > 60) %>%  
+  dplyr::filter(JULIANDAY < 330) %>% 
+  rowwise() %>%
+  mutate('ZOOP.THOUS.M3' = sum(c_across(CYCLO.THOUS.M3:DIAPHAN.THOUS.M3))) %>% 
+  select(year, min_ice_off_julian, min_ice_off_date, ice_off_anomaly, 
+         DNRID, SITE, DATE, TOW, ZOOP.THOUS.M3, everything()) %>% ungroup() %>% as.data.frame() %>%
+  mutate(ice_off_anomaly_s = scale(ice_off_anomaly),
+         JULIANDAY_s = scale(JULIANDAY))
+
+sampling.events <- temp %>% group_by(DNRID, year) %>% count() #%>% filter(n > 200)
+median(sampling.events$n)
+
+
+```
+
+# Random stuff to use later
+```{r}
+
+ice_off_green <- read.csv("./data/ice_off_summarized.csv") %>%
+  mutate(DNRID = fixlakeid(DOW)) %>% 
+  dplyr::select(DNRID, year, min_ice_off_julian, min_ice_off_date) %>% 
+  filter(DNRID == "34007900") %>% filter(year <= 1980) %>% 
+  summarize(mean = mean(min_ice_off_julian))
+
+early.anomaly_s <- standardize2match(early.anomaly, temp$ice_off_anomaly)
+late.anomaly_s <- standardize2match(late.anomaly, temp$ice_off_anomaly)
+
+jd_sd <- sd(temp$JULIANDAY)
+jd_mean <- mean(temp$JULIANDAY)
+
+sd <- sd(temp$ice_off_anomaly)
+mean <- mean(temp$ice_off_anomaly)
+
+start <- standardize2match(80, temp$JULIANDAY)
+end <- standardize2match(274, temp$JULIANDAY)
+
+undo_jd <- function(x){
+  return(x*jd_sd + jd_mean)
+}
+```
+
+
+# Run all GAMS
+```{r}
+# loops through columns 10-20 in the dataframe temp and runs nb GAMMs
+# TO DO - Play with offsets and counts 
+models <- list()
+
+for (i in 10:18) {
+  
+  single.model <- gam(temp[,i] ~ s(ice_off_anomaly_s) + 
+                      s(JULIANDAY_s) + 
+                      s(ice_off_anomaly_s, JULIANDAY_s) +
+                      s(DNRID, bs = "re") + s(year_f, bs = "re"),
+                    method = "REML", select = T,
+                    data = temp, family = nb())
+  
+  models[[paste0(colnames(temp)[i])]] <- single.model
+}
+
+# Could be worse IMO. seems like there some too many zero stripes
+#appraise(models$CYCLO.THOUS.M3)
+#draw(models$CYCLO.THOUS.M3)
+#
+draw(models$CALA.THOUS.M3)
+#appraise(models$NAUP.THOUS.M3)
+#appraise(models$ROTIF.THOUS.M3)
+#draw(models$DAPH.THOUS.M3)
+#appraise(models$BOSM.THOUS.M3)
+#appraise(models$CHYD.THOUS.M3)
+#appraise(models$CERIOD.THOUS.M3)
+#appraise(models$LEPTO.THOUS.M3)
+#appraise(models$OTHER.THOUS.M3)
+
+#write_rds(models, "./models/zoop.models_s.rds")
+```
+
+# Read-in outputted models
+```{r}
+models <- read_rds("./models/zoop.models_s.rds")
+```
+
+# DOY change - FUNCTION
+```{r}
+hist(temp$JULIANDAY) # Approx 125-275 for peak sampling, look at 100 - 300
+quantile(temp$JULIANDAY_s, c(0.05, 0.95))
+hist(temp$ice_off_anomaly, breaks = 20)
+quantile(temp$ice_off_anomaly)
+# Thoughts to do - Change x-axis to Months
+
+plot.zoop.doy = function(model = NA, var.name = NA, type = "plot", slice = 1, y.label = NA, 
+                         early.anomaly_s = -0.9348572, late.anomaly_s = 1.579282, 
+                         start.date_s = start, end.date_s = end) {
+  
+  model <- models[[var.name]]
+  # Year and DNRID aren't used but are required for predict.gam
+  length <- length(seq(90, 274, by = 1))
+  pred.df <- data.frame(
+                        ice_off_anomaly_s = c(rep(early.anomaly_s, length), rep(0, length), 
+                                            rep(late.anomaly_s, length)),
+                        ice_off_anomaly = c(rep(early.anomaly, length), rep(0, length), 
+                                            rep(late.anomaly, length)),
+                        JULIANDAY_s = seq(start.date_s, end.date_s, length.out = length),
+                        JULIANDAY = seq(90, 274),
+                        TOW = 2,
+                        DNRID = "62001200", year_f = "1981") 
+  
+  fit <- predict.gam(model, pred.df,
+                     unconditional = T, # Gives simultaneous
+                     type = "response",
+                     exclude = c('s(DNRID)', 
+                                's(year_f)'),
+                     se.fit = T)
+  pred.df$predictions = fit$fit
+  pred.df$se = fit$se.fit
+  
+  y.label <- species.labels %>% filter(variable == var.name) %>% 
+      dplyr::select(axis.label) %>% as.character()
+  
+  pred.df %>%
+    mutate(ice_off_anomaly = as.factor(ice_off_anomaly_s),
+           ice_off_descriptor = ifelse(ice_off_anomaly_s == early.anomaly_s, 
+                                       "Early", "Normal"),
+           ice_off_descriptor = ifelse(ice_off_anomaly_s == late.anomaly_s, 
+                                       "Late", ice_off_descriptor)) %>%
+    ggplot(aes(y = predictions, x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+               color = ice_off_anomaly)) +
+    #geom_point() +
+    geom_line(aes(y = predictions, x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+                  color = ice_off_descriptor), lwd = 2) +
+    #geom_ribbon(aes(ymin = predictions - se, ymax = predictions + se, 
+    #                fill = ice_off_descriptor, color = ice_off_descriptor), 
+    #            lwd = 0.5, alpha = 0.05) +
+    theme_classic() +
+    scale_x_date(date_breaks = "months" , date_labels = "%b") + 
+    labs(y = paste0(y.label), x = "Julian Day", 
+         color = "Ice-Off \nAnomaly", fill = "Ice-Off \nAnomaly") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16))
+}
+```
+
+
+# Plot DOY change - FIGURE S7
+```{r}
+hist(temp$JULIANDAY) # Approx 125-275 for peak sampling, look at 100 - 300
+min(temp$JULIANDAY)
+
+# Thoughts to do - Change x-axis to Months
+species.labels <- data.frame(variable = c(names(models)), 
+           axis.label = c("Cyclopoid Density", "Calanoid Density", 
+                          "Nauplii Density", "Rotifer Density", 
+                          "Daphnia Density", "Bosmina Density", 
+                          "Chydoridae Density", "Ceriodaphnia Density", 
+                          "Diaphanosoma Density"))
+
+
+cyclo.doy <- plot.zoop.doy(var.name = "CYCLO.THOUS.M3") + theme(legend.position = "none")
+cyclo.doy 
+cala.doy <- plot.zoop.doy(var.name = "CALA.THOUS.M3") + 
+  theme(legend.position = "none")
+naup.doy <- plot.zoop.doy(var.name = "NAUP.THOUS.M3") + 
+  theme(legend.position = "none")
+rotif.doy <- plot.zoop.doy(var.name = "ROTIF.THOUS.M3") + 
+  theme(legend.position = "none")
+daph.doy <- plot.zoop.doy(var.name = "DAPH.THOUS.M3") + 
+  theme(legend.position = "none")
+bosm.doy <- plot.zoop.doy(var.name = "BOSM.THOUS.M3") + 
+  theme(legend.position = "none")
+ceriod.doy <- plot.zoop.doy(var.name = "CERIOD.THOUS.M3") + 
+  theme(legend.position = "none")
+diaphan.doy <- plot.zoop.doy(var.name = "DIAPHAN.THOUS.M3") + 
+  theme(legend.position = c(0.25, 0.75))
+
+
+
+zoop <- cowplot::plot_grid(cyclo.doy, cala.doy, naup.doy, rotif.doy, daph.doy, 
+                   bosm.doy, ceriod.doy, diaphan.doy)
+zoop
+# Figure S7
+ggsave("./figures/FigureS7.jpeg", height = 10, width = 12)
+```
+
+
+
+# Bayesian peak timing - FIGURE S2 (and Code for other figures)
+```{r}
+toy.df <- data.frame(ice_off_anomaly_s = c(rep(early.anomaly_s, 221), rep(0, 221), 
+                                          rep(late.anomaly_s, 221)),
+                      JULIANDAY_s = seq(start, end, length.out = 221), 
+                      DNRID = "82016700", year_f = "2000") %>%
+    mutate(row = row_number()) %>% 
+    mutate(ice_off_f =  ifelse(ice_off_anomaly_s == early.anomaly_s, "Early", "Normal"),
+           ice_off_f =  ifelse(ice_off_anomaly_s == late.anomaly_s, "Late", ice_off_f),
+           ice_off_f =  ifelse(ice_off_anomaly_s == 0, "Average", ice_off_f))
+
+
+iters <- names(models)
+
+timing.cis <- data.frame(group = character(0), 
+                   numeric = numeric(0),
+                   timing = character(0),
+                   median = numeric(0),
+                   lower.95 = numeric(0),
+                   upper.95 = numeric(0),
+                   lower.75 = numeric(0),
+                   upper.75 = numeric(0))
+
+pred.df = toy.df
+
+for (i in 1:length(iters)) {
+  model = models[[iters[i]]]
+  
+  # Use posterior dist of the mean to get posterior fitted values
+  sims <- fitted_samples(model, exclude = c('s(DNRID)',  's(year_f)'),
+                         newdata = pred.df, n = 1000, seed = 1024) |>
+  left_join(pred.df |> select(row, ice_off_anomaly_s, JULIANDAY_s, ice_off_f), 
+            by = join_by(row == row))
+  
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  early <- sims %>% filter(ice_off_anomaly_s == early.anomaly_s) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  early.quant <- quantile(early$JULIANDAY_s, probs = c(.025,.975))
+  early.quant.75 <- quantile(early$JULIANDAY_s, probs = c(.125, .875))
+  early.median <- median(early$JULIANDAY_s)
+
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  late <- sims %>% filter(ice_off_anomaly_s == late.anomaly_s) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  late.quant <- quantile(late$JULIANDAY_s, probs = c(.025,.975))
+  late.quant.75 <- quantile(late$JULIANDAY_s, probs = c(.125, .875))
+  late.median <- median(late$JULIANDAY_s)
+  
+  average <- sims %>% filter(ice_off_anomaly_s == 0) %>% 
+    group_by(draw) %>% slice_max(fitted)
+  average.quant <- quantile(average$JULIANDAY_s, probs = c(.025,.975))
+  average.quant.75 <- quantile(average$JULIANDAY_s, probs = c(.125, .875))
+  average.median <- median(average$JULIANDAY_s)
+  
+  # Get the difference between peak timings
+  diff.early <- early$JULIANDAY_s - average$JULIANDAY_s
+  diff.earlymedian <- median(diff.early)
+  diff.earlyquant <- quantile(diff.early, probs = c(.025,.975))
+  diff.earlyquant.75 <- quantile(diff.early, probs = c(.125, .875))
+  
+  diff.late <- late$JULIANDAY_s - average$JULIANDAY_s
+  diff.latemedian <- median(diff.late)
+  diff.latequant <- quantile(diff.late, probs = c(.025,.975))
+  diff.latequant.75 <- quantile(diff.late, probs = c(.125, .875))
+
+  # Make new data frame to rbind to big data frame
+  df <- data.frame(group = iters[[i]], 
+                   numeric = i,
+                   timing = c("Early", "Late", "Average", 
+                              "Early Difference", "Late Difference"),
+                   median = c(early.median, late.median, average.median, 
+                              diff.earlymedian, diff.latemedian),
+                   lower.95 = c(early.quant[1], late.quant[1], average.quant[1], 
+                                diff.earlyquant[1], diff.latequant[1]),
+                   upper.95 = c(early.quant[2], late.quant[2], average.quant[2],
+                                diff.earlyquant[2], diff.latequant[2]),
+                   lower.75 = c(early.quant.75[1], late.quant.75[1], average.quant.75[1],
+                                diff.earlyquant.75[1], diff.latequant.75[1]),
+                   upper.75 = c(early.quant.75[2], late.quant.75[2], average.quant.75[2],
+                                diff.earlyquant.75[2], diff.latequant.75[2]))
+  
+  timing.cis <- rbind(timing.cis, df)
+  pred.df = toy.df
+}
+
+row.names(timing.cis) <- NULL
+
+species.labels <- data.frame(variable = names(models), 
+  axis.label = c("Cyclopoid Peak", "Calanoid Peak", 
+                 "Nauplii Peak", "Rotifer Peak", "Daphnia Peak", 
+                 "Bosmina Peak",  "Chydoridae Peak", "Ceriodaphnia Peak", 
+                 "Diaphanosoma Peak"))
+
+timing.cis.plot <- timing.cis %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit),
+         jit = ifelse(timing == "Early Difference", -0.15, jit)) %>%
+  merge(y = species.labels, by.x = "group", by.y = "variable") %>%
+  mutate(axis.label = 
+           factor(axis.label, levels = c(
+             "Cyclopoid", "Calanoid", "Nauplii", "Rotifer", 
+             "Daphnia", "Bosmina", "Chydoridae", "Ceriodaphnia", "Diaphanosoma"))) %>%
+  mutate(across(median:upper.75, 
+                ~ if_else(row_number() %in% grep("Difference", timing), .*jd_sd, undo_jd(.))))
+
+timing.cis.plot$timing <- factor(timing.cis.plot$timing, 
+                                 levels = c("Early", "Average", "Late", 
+                                            "Early Difference", "Late Difference"))
+
+
+timing.cis.plot %>%
+  filter(!grepl("Difference", timing)) %>%
+  #mutate(across(median:upper.75, undo_jd)) %>%
+  ggplot() + 
+  geom_point(aes(x = as.Date(median, origin = as.Date("2018-01-01")), y = -1*(numeric + jit),
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.95, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.95, origin = as.Date("2018-01-01")), color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.75, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.75, origin = as.Date("2018-01-01")), color = timing), 
+               linewidth = 1.5) +
+  #facet_grid(group ~., switch = "y") +
+  theme_classic() +
+  labs(y = "",
+       x = "Day Peak Density Occurs", color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#FF0000", "#000000", "#0000FF")) +
+  scale_y_continuous(breaks = -1:-9, labels = levels(timing.cis.plot$axis.label)) +
+  scale_x_date(date_labels = "%b")
+  #scale_x_continuous(breaks = seq(100, 275, by = 25))
+
+# Figure S2
+#ggsave("./figures/FigureS2.jpeg", height = 10, width = 10)
+```
+
+
+
+
+
+# FIGURE 2A - Bayesian peak timing - SUBSET - Calendar DOY
+```{r}
+#read in more data
+timing.cis.wae <- read.csv("./data/wae_spawning_modeled.csv")
+timing.cis.phyto <- read.csv("./data/phyto_modeled_peak.csv")
+
+# y-axis plot labels
+subset.labels = c("Cryptomonad", #"Dinoflagellate",
+                  "Diatom", "Green-algae", 
+                  "Cyclopoid", #"Calanoid",
+                  "Daphnia", "Walleye \n Peak Spawning")
+
+# groups to keep while filtering
+groups_to_keep <- c("GREEN", "DIATOM", "CRYPTOS", #"DINOS",
+                    "CYCLO.THOUS.M3", "DAPH.THOUS.M3", "peak")
+
+# x-axis plot labels
+labels = c("April 1st", "April 15th", "May 1st", "May 15th", 
+           "June 1st", "June 15th", "July 1st")
+
+# bind data together
+timing.cis.plot.all <- rbind(timing.cis.plot, timing.cis.wae, timing.cis.phyto) %>% 
+  filter(group != "start")
+
+plankton_subset_wae <- timing.cis.plot.all %>%
+  filter(!grepl("Difference", timing)) %>%
+  filter(group %in% groups_to_keep) %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit),
+         jit = ifelse(timing == "Early Difference", -0.15, jit)) %>%
+  mutate(numeric = ifelse(group == "peak", 6, numeric),
+         numeric = ifelse(group == "CYCLO.THOUS.M3", 4, numeric),
+         numeric = ifelse(group == "CRYPTOS", 1, numeric),
+         numeric = ifelse(group == "DIATOM", 2, numeric),
+         numeric = ifelse(group == "GREEN", 3, numeric),
+         numeric = ifelse(group == "DAPH.THOUS.M3", 5, numeric)) %>%
+  ggplot() + 
+  geom_point(aes(x = as.Date(median, origin = as.Date("2018-01-01")), y = -1*(numeric + jit),
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.95, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.95, origin = as.Date("2018-01-01")), color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = as.Date(lower.75, origin = as.Date("2018-01-01")), 
+                   xend = as.Date(upper.75, origin = as.Date("2018-01-01")), color = timing),
+               linewidth = 1.5) +
+  #facet_grid(group ~., switch = "y") +
+  theme_classic() +
+  labs(y = "",
+       x = "Day Peak Density Occurs", color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  theme(legend.position = c(.8, .1)) +
+  scale_color_manual(values = c("#FF0000", "#000000",  "#0000FF")) +
+  scale_y_continuous(breaks = -1:-6, labels = subset.labels) +
+  scale_x_date(breaks = as.Date(c("2018-04-01", "2018-04-15","2018-05-01", "2018-05-15", 
+                                  "2018-06-01", "2018-06-15", "2018-07-01")),
+               label = labels)
+
+plankton_subset_wae
+# Figure 2A
+ggsave("./figures/Figure2A.jpeg", height = 8, width = 10)
+```
+
+
+# FIGURE 2B - Bayesian peak timing - SUBSET - rate of change 
+```{r}
+subset.labels = c("Cryptomonad", "Dinoflagellate",
+                  "Diatom", "Green-algae", 
+                  "Cyclopoid", #"Calanoid",
+                  "Daphnia", "Walleye \n Peak Spawning")
+groups_to_keep <- c("GREEN", "DIATOM", "CRYPTOS", "DINOS",
+                    "CYCLO.THOUS.M3", "DAPH.THOUS.M3", "peak")
+
+rate_of_change <- timing.cis.plot.all %>%
+  filter(grepl("Difference", timing)) %>%
+  filter(group %in% c(groups_to_keep)) %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit),
+         jit = ifelse(timing == "Early Difference", -0.15, jit)) %>%
+  mutate(numeric = ifelse(group == "CRYPTOS", 1, numeric),
+         numeric = ifelse(group == "DIATOM", 2, numeric),
+         numeric = ifelse(group == "GREEN", 3, numeric),
+         numeric = ifelse(group == "DINOS", 4, numeric),
+         numeric = ifelse(group == "CYCLO.THOUS.M3", 5, numeric),
+         numeric = ifelse(group == "DAPH.THOUS.M3", 6, numeric),
+         numeric = ifelse(group == "peak", 7, numeric)) %>%
+  mutate(timing = ifelse(timing == "Early Difference", 
+                         "Difference between early \nand average ice off", 
+                         "Difference between late \nand average ice off")) %>%
+  mutate(median = ifelse(timing == "Difference between early \nand average ice off", 
+                         median/(-1*early.anomaly), median/late.anomaly),
+         upper.95 = ifelse(timing == "Difference between early \nand average ice off",
+                           upper.95/(-1*early.anomaly), upper.95/late.anomaly),
+         lower.95 = ifelse(timing == "Difference between early \nand average ice off",
+                           lower.95/(-1*early.anomaly), lower.95/late.anomaly),
+         upper.75 = ifelse(timing == "Difference between early \nand average ice off",
+                           upper.75/(-1*early.anomaly), upper.75/late.anomaly),
+         lower.75 = ifelse(timing == "Difference between early \nand average ice off",
+                           lower.75/(-1*early.anomaly), lower.75/late.anomaly)) %>%
+  ggplot() + 
+  geom_point(aes(x = median, y = -1*(numeric + jit),
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.95, 
+                   xend = upper.95, color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.75, xend = upper.75, color = timing), linewidth = 1.5) +
+  geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+  geom_vline(xintercept = -1, color = "grey", linewidth = .75) +
+  geom_vline(xintercept = 1, color = "grey", linewidth = .75) +
+  theme_classic() +
+  labs(y = "",
+       x = "Change in Days Event Occurs Per\n Day Change in Ice-Off", 
+       color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#FF0000", "#0000FF")) +
+  scale_y_continuous(breaks = -1:-7, labels = subset.labels) + theme(legend.position="none")
+
+rate_of_change
+#Figure 2B
+ggsave("./figures/Figure2B.jpeg", height = 8, width = 9)
+```
+
+
+# Figure 2 - Combining two figures
+```{r}
+cowplot::plot_grid(plankton_subset_wae, rate_of_change, labels = "AUTO", rel_widths = c(.55, .45))
+ggsave("./figures/Figure2.jpeg", height = 10, width = 15)
+```
+
+
+# FIGURE 5 - Recreating Feiner et al. 2022 figure
+```{r}
+feiner.df <- data.frame(ice_off_anomaly_s = numeric(0),
+                        JULIANDAY_s = numeric(0),
+                        DNRID = numeric(0), year_f = numeric(0),
+                        name = character(0), count = numeric(0)
+                        )
+anomaly = c(early.anomaly_s, 0, late.anomaly_s)
+
+for (i in 1:3) {
+  pred.df <- data.frame(ice_off_anomaly_s = anomaly[i],
+                        JULIANDAY_s = seq(start, end, length.out = 221), 
+                        DNRID = "62001200", year_f = "2000") 
+    
+  fit <- predict.gam(models$CYCLO.THOUS.M3, pred.df,
+                     unconditional = T, # Gives simultaneous
+                     type = "response",
+                     exclude = c('s(DNRID)', 's(year_f)'),
+                     se.fit = T)
+  pred.df$Cyclopoid = fit$fit
+  
+  fit.daph <- predict.gam(models$DAPH.THOUS.M3, pred.df,
+                     unconditional = T, # Gives simultaneous
+                     type = "response",
+                     exclude = c('s(DNRID)', 's(year_f)'),
+                     se.fit = T)
+  
+  pred.df$Daphnia = fit.daph$fit
+  
+  
+  pred.df.long <- pred.df %>% pivot_longer(cols = Cyclopoid:Daphnia, values_to = "count") %>%
+    mutate(JULIANDAY = undo_jd(JULIANDAY_s))
+  feiner.df = rbind(feiner.df, pred.df.long)
+}
+
+personal_theme = theme_classic() +
+  theme(axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)) +
+  theme(plot.title = element_text(size = 16, hjust = 0.5))
+
+early.anomaly.plot <- feiner.df %>%
+  filter(ice_off_anomaly_s == early.anomaly_s) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = as.Date(ice_off_green$mean + early.anomaly, origin = as.Date("2018-01-01")), 
+                 color = "Ice-Off"), linewidth = 1.5) +
+  geom_vline(aes(xintercept = as.Date(106.056329, origin = as.Date("2018-01-01")), 
+                 color = "Walleye Spawning"), linewidth = 1) + 
+  # Change value with how much Walleye spawning gets earlier
+  geom_ribbon(aes(x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), 
+                  ymax = count, fill = name), ymin = 0, alpha = 0.3) + 
+  coord_cartesian(xlim = as.Date(c("2018-03-31", "2018-10-15")), 
+                  ylim = c(0, 40)) +
+  scale_y_continuous(expand = c(0,0)) +
+  labs(title = "Early Ice-Off", 
+       y = "Indivduals/L",
+       x = "Month", fill = "", color = "") + 
+  scale_color_manual(guide = "legend", 
+                       breaks = c("Ice-Off", "Walleye Spawning"),
+                       values = c("Ice-Off" = "Grey", "Walleye Spawning" = "Black")) +
+  scale_fill_manual(guide = "legend", breaks = c("Cyclopoid", "Daphnia"), 
+                    values = c("Cyclopoid" = "Brown", "Daphnia" = "green")) +
+  scale_x_date(breaks = "1 month", date_labels = "%b") +
+  personal_theme + theme(legend.position = "none")
+  
+early.anomaly.plot
+
+average.anomaly.plot = feiner.df %>%
+  filter(ice_off_anomaly_s == 0) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept = as.Date(ice_off_green$mean, origin = as.Date("2018-01-01")), 
+                 color = "Ice-Off"), linewidth = 1.5) +
+  geom_vline(aes( xintercept = as.Date(113.902538, origin = as.Date("2018-01-01")), 
+                  color = "Walleye Spawning"), 
+             linewidth = 1) + 
+  # Change value with how much Walleye spawning gets earlier
+  geom_ribbon(aes(x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), ymax = count, fill = name), 
+              ymin = 0, alpha = 0.3) + 
+  coord_cartesian(xlim = as.Date(c("2018-03-31", "2018-10-15")), ylim = c(0, 40)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  labs(title = "Average Ice-Off", 
+    y = "Indivduals/L",
+    x = "Month", fill = "", color = "") + 
+  scale_color_manual(guide = "legend", 
+                       breaks = c("Ice-Off", "Walleye Spawning"),
+                       values = c("Ice-Off" = "Grey", "Walleye Spawning" = "Black")) +
+  scale_fill_manual(guide = "legend", breaks = c("Cyclopoid", "Daphnia"), 
+                    values = c("Cyclopoid" = "Brown", "Daphnia" = "green")) +
+  scale_x_date(breaks = "1 month", date_labels = "%b") +
+  personal_theme + theme(legend.position = c(.8, .7))
+
+average.anomaly.plot
+
+
+late.anomaly.plot = feiner.df %>%
+  filter(ice_off_anomaly_s == late.anomaly_s) %>%
+  ggplot() + 
+  geom_vline(aes(xintercept =  as.Date(ice_off_green$mean + late.anomaly, origin = as.Date("2018-01-01")), 
+                 color = "Ice-Off"), linewidth = 1.5) +
+  geom_vline(aes(xintercept = as.Date(124.215987, origin = as.Date("2018-01-01")), 
+                 # 10 = late anomaly for walleye
+                 color = "Walleye Spawning"), 
+             linewidth = 1) + 
+  # Change value with how much Walleye spawning gets earlier
+  geom_ribbon(aes(x = as.Date(JULIANDAY, origin = as.Date("2018-01-01")), ymax = count, fill = name), 
+              ymin = 0, alpha = 0.3) + 
+  coord_cartesian(xlim = as.Date(c("2018-03-31", "2018-10-15")), ylim = c(0, 40)) + 
+  scale_y_continuous(expand = c(0,0)) +
+  labs(title = "Late Ice-Off",
+    y = "Indivduals/L",
+    x = "Month", fill = "", color = "") + 
+  scale_color_manual(guide = "legend", 
+                       breaks = c("Ice-Off", "Walleye Spawning"),
+                       values = c("Ice-Off" = "Grey", "Walleye Spawning" = "Black")) +
+  scale_fill_manual(guide = "legend", breaks = c("Cyclopoid", "Daphnia"), 
+                    values = c("Cyclopoid" = "Brown", "Daphnia" = "green")) +
+  scale_x_date(breaks = "1 month", date_labels = "%b") + 
+  personal_theme + theme(legend.position = "none") 
+late.anomaly.plot
+
+cowplot::plot_grid(early.anomaly.plot, average.anomaly.plot, late.anomaly.plot, 
+                   nrow = 3, ncol = 1, labels = "AUTO")
+
+#Figure 5
+ggsave("./figures/Figure5.jpeg", height = 10, width = 10)
+```
+
+
+# Figure S5 - Bayesian peak timing - SUBSET - rate of change 
+```{r}
+subset.labels = c("Bosmina", "Calanoid", "Ceriodaphnia", "Chrysomonad", "Chydorus", "Cryptomonad", 
+                  "Cyanobacteria", "Cyclopoid","Daphnia", "Diaphanosoma", "Diatom", "Dinoflagellate",
+                  "Green-algae", "Nauplii", "Rotifera", "Walleye \n Peak Spawning")
+
+
+all_rate_of_change <- timing.cis.plot.all %>%
+  filter(grepl("Difference", timing)) %>%
+  filter(!group %in% c("ZOOP.THOUS.M3", "ALL.CELLS")) %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit),
+         jit = ifelse(timing == "Early Difference", -0.15, jit),
+         numeric = as.numeric(factor(group)),
+         numeric = ifelse(group == "ROTIF.THOUS.M3", 15, numeric),
+         numeric = ifelse(group == "peak", 16, numeric)) %>%
+  mutate(timing = ifelse(timing == "Early Difference", 
+                         "Early ice-off", 
+                         "Late ice-off")) %>%
+  mutate(median = ifelse(timing == "Early ice-off", 
+                         median/(-1*early.anomaly), median/late.anomaly),
+         upper.95 = ifelse(timing == "Early ice-off",
+                           upper.95/(-1*early.anomaly), upper.95/late.anomaly),
+         lower.95 = ifelse(timing == "Early ice-off",
+                           lower.95/(-1*early.anomaly), lower.95/late.anomaly),
+         upper.75 = ifelse(timing == "Early ice-off",
+                           upper.75/(-1*early.anomaly), upper.75/late.anomaly),
+         lower.75 = ifelse(timing == "Early ice-off",
+                           lower.75/(-1*early.anomaly), lower.75/late.anomaly)) %>%
+  ggplot() + 
+  geom_point(aes(x = median, y = -1*(numeric + jit),
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.95, 
+                   xend = upper.95, color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.75, xend = upper.75, color = timing), linewidth = 1.5) +
+  geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+  geom_vline(xintercept = -1, color = "grey", linewidth = .75) +
+  geom_vline(xintercept = 1, color = "grey", linewidth = .75) +
+  theme_classic() +
+  labs(y = "",
+       x = "Change in Days Event Occurs Per\n Day Change in Ice-Off", 
+       color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#FF0000", "#0000FF")) +
+  scale_y_continuous(breaks = -1:-16, labels = subset.labels) + theme(legend.position="none")
+
+all_rate_of_change
+# Figure S5
+ggsave("./figures/FigureS5.jpeg", height = 8, width = 9)
+```
+  
+
+# See if zooplankton bloom size changes with ice-anomaly  
+## Figure S6
+```{r}
+species.labels <- data.frame(variable = names(models), 
+  axis.label = c("Cyclopoid", "Calanoid", 
+                 "Nauplii", "Rotifer", "Daphnia", 
+                 "Bosmina",  "Chydoridae", "Ceriodaphnia", 
+                 "Diaphanosoma"))
+
+
+bloom.size <- timing.cis.plot.all %>% 
+  filter(!timing %in% c("Early Difference", "Late Difference")) %>% # filter out relative changes in timing
+  filter(!group %in% c("peak")) %>% # filter out peak walleye spawning, not relevant
+  filter(!group %in% c("CHRYSOS", "CRYPTOS", "CYANOS", "DIATOM", "DINOS", "GREEN")) %>%
+  mutate(row = row_number(), 
+         ice_off_anomaly_s = ifelse(timing == "Early", early.anomaly_s, 0), 
+         ice_off_anomaly_s = ifelse(timing == "Late",  late.anomaly_s, ice_off_anomaly_s))
+
+bloom.size.plot <- data.frame(group = character(0), ice_off_anomaly = numeric(0),
+                     median = numeric(0), 
+                     q2.5 = numeric(0), q97.5 = numeric(0),
+                     q25 = numeric(0), q75 = numeric(0))
+
+groups = unique(bloom.size$group)
+
+for (i in 1:length(groups)) {
+  model = models[[groups[i]]]
+  
+  group.df <- bloom.size %>% filter(group == groups[i])
+  
+  pred.df <- data.frame(JULIANDAY = 
+                          c(
+                          seq(group.df$median[1] - 7, group.df$median[1] + 7, by = 1 ),
+                          seq(group.df$median[2] - 7, group.df$median[2] + 7, by = 1 ),
+                          seq(group.df$median[3] - 7, group.df$median[3] + 7, by = 1 )), 
+                        ice_off_anomaly_s = c(rep(group.df$ice_off_anomaly_s[1], 15),
+                                            rep(group.df$ice_off_anomaly_s[2], 15),
+                                            rep(group.df$ice_off_anomaly_s[3], 15)),
+                        DNRID = "82016700", year_f = "2000") %>% 
+    mutate(row = row_number()) %>% 
+    mutate(JULIANDAY_s = standardize2match(JULIANDAY, temp$JULIANDAY))
+  
+  sims <- fitted_samples(model, exclude = c('s(DNRID)',  's(year_f)'),
+                         newdata = pred.df, n = 1000, seed = 1024) |>
+    left_join(pred.df |> select(row, ice_off_anomaly_s, JULIANDAY_s), 
+              by = join_by(row == row))
+  
+  
+  early.diff <- ((sims[sims$ice_off_anomaly_s == early.anomaly_s,]$fitted - 
+    sims[sims$ice_off_anomaly_s == 0,]$fitted) / 
+    sims[sims$ice_off_anomaly_s == 0,]$fitted) * 100
+  late.diff <- ((sims[sims$ice_off_anomaly_s == late.anomaly_s,]$fitted - 
+    sims[sims$ice_off_anomaly_s == 0,]$fitted) / 
+      sims[sims$ice_off_anomaly_s == 0,]$fitted) * 100
+  
+  temp_toadd <- data.frame(group = groups[i], 
+                     ice_off_anomaly = c("Early", "Late"),
+                     median = c(median(early.diff), median(late.diff)),
+                     q2.5 = c(quantile(early.diff, prob = c(0.025)),
+                              quantile(late.diff, prob = c(0.025))),
+                     q97.5 = c(quantile(early.diff, prob = c(0.975)),
+                              quantile(late.diff, prob = c(0.975))),
+                     q25 = c(quantile(early.diff, prob = c(0.75)),
+                              quantile(late.diff, prob = c(0.75))),
+                     q75 = c(quantile(early.diff, prob = c(0.25)),
+                              quantile(late.diff, prob = c(0.25))))
+  bloom.size.plot <- rbind(bloom.size.plot, temp_toadd)
+  
+}
+
+bloom.size.plot %>%
+  merge(species.labels, by.y = "variable", by.x = "group") %>%
+  ggplot() + 
+  geom_point(aes(y = median, x = ice_off_anomaly, color = ice_off_anomaly)) + 
+  geom_segment(aes(y = q2.5, yend = q97.5, x = ice_off_anomaly, 
+                   xend = ice_off_anomaly, color = ice_off_anomaly)) + 
+  geom_segment(aes(y = q25, yend = q75, x = ice_off_anomaly, 
+                   xend = ice_off_anomaly, color = ice_off_anomaly), 
+               linewidth = 1.5) +
+  geom_hline(yintercept = 0, linetype = 'dotted') +
+  facet_wrap(vars(axis.label), scales = "free") + 
+  scale_color_manual(values = c("#FF0000", "#000000",  "#0000FF")) + 
+  labs(y = "% Change in Abundance From Normal Ice-Off",
+       x = "Ice-Off Timing", color = "Ice-Off Timing") +
+  theme_classic() +
+  theme(legend.position = c(.45, .935)) 
+
+# Figure S6
+ggsave("./figures/FigureS6.jpeg", height = 8, width = 9)
+```
+
+
+
+# GRAVEYARD
+
+
+
+### NOT USED IN PAPER ###
+# Bayesian peak timing - SUBSET - relative DOY
+```{r, eval = F}
+subset.labels = c("Cyclopoid", 
+                  "Daphnia", "Walleye \n Peak Spawning")
+
+timing.cis.plot.all %>%
+  filter(grepl("Difference", timing)) %>%
+  filter(group %in% c("CYCLO.THOUS.M3", "DAPH.THOUS.M3", "peak")) %>%
+  mutate(numeric = ifelse(group == "DAPH.THOUS.M3", 3, numeric)) %>%
+  mutate(numeric = ifelse(group == "peak", 4, numeric)) %>%
+  mutate(timing = ifelse(timing == "Early Difference", 
+                         "Difference between early \nand average ice off", 
+                         "Difference between late \nand average ice off")) %>%
+  ggplot() + 
+  geom_point(aes(x = median, y = -1*(numeric + jit),
+                 color = timing), size = 2) + 
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.95, 
+                   xend = upper.95, color = timing)) +
+  geom_segment(aes(y = -1*(numeric + jit), yend = -1*(numeric + jit), 
+                   x = lower.75, xend = upper.75, color = timing), linewidth = 1.5) +
+  geom_vline(xintercept = 0, color = "black", linewidth = 1) +
+  theme_classic() +
+  labs(y = "",
+       x = "Change in Days Event Occurs", color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#0000FF",  "#FF0000")) +
+  scale_y_continuous(breaks = -1:-3, labels = subset.labels) 
+
+#ggsave("./figures/diff_peak_density_zoop_subset_with_wae.jpeg", height = 8, width = 9)
+```
+
+
+
+# Can I do it in one model
+```{r}
+long <- temp %>% select(-c(ZOOP.THOUS.M3, OTHER.THOUS.M3, LEPTO.THOUS.M3)) %>% 
+  pivot_longer(cols = CYCLO.THOUS.M3:DIAPHAN.THOUS.M3,
+               values_to = "count",
+               names_to = "group") %>%
+  mutate(group = as.factor(group))
+
+single.model.zoo <- gam(count ~ group + 
+              s(JULIANDAY, ice_off_anomaly, m = 2) + 
+              s(JULIANDAY, ice_off_anomaly, by = group, bs = "tp", m = 1) +
+              s(DNRID, bs = "re") +
+              s(year_f, bs = "re"),
+            family = tw(link = "log"),
+            method = "REML", 
+            data = long)
+summary(single.model.zoo)
+appraise(single.model.zoo)
+
+#write_rds(single.model.zoo, "./models/multispecies.zoop.model.rds")
+```
+

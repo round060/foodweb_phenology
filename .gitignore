@@ -1,3 +1,7 @@
+/data
+/models
+/figures
+
 # History files
 .Rhistory
 .Rapp.history

@@ -1,0 +1,299 @@
+---
+title: "egg_ice"
+author: "Chris R"
+date: "5/29/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(mnsentinellakes) #https://github.com/mnsentinellakes/mnsentinellakes
+library(brms)
+library(mgcv)
+library(gratia)
+library(lme4)
+library(mwlaxeref)
+library(arrow)
+library(cowplot)
+options(scipen = 999)
+
+# Creates a figure directory
+dir.create(file.path("./figures"))
+
+select <- dplyr::select
+
+early.anomaly = -17.52
+late.anomaly = 14
+
+filtered_phenology <- read.csv("./data/wae_spawning_clean.csv") %>%
+  mutate(location = as.factor(location), 
+         year_f = as.factor(year))
+
+
+filtered_phenology %>% group_by(location, event) %>% count()
+```
+
+
+
+# Model Spawning Phenology
+```{r}
+peak_spawning <- filtered_phenology %>% filter(event == "peak")
+
+with(peak_spawning, plot(ice_off_anomaly, julian_day))
+
+spawning_model_peak <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "re"), 
+                           data = peak_spawning)
+appraise(spawning_model_peak)
+summary(spawning_model_peak)
+gam.check(spawning_model_peak)
+draw(spawning_model_peak, residuals = T,)
+#ggsave("./figures/spawning_peak.jpeg", height = 7, width = 6)
+
+start_spawning <- filtered_phenology %>% filter(event == "start")
+with(start_spawning, plot(ice_off_anomaly, julian_day))
+spawning_model_start <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "re"), 
+                            data = start_spawning)
+appraise(spawning_model_start)
+draw(spawning_model_start, residuals = T, select = 1)
+#ggsave("./figures/spawning_start.jpeg", height = 7, width = 6)
+summary(spawning_model_start)
+
+
+models <- list(peak = spawning_model_peak, start = spawning_model_start)
+```
+
+
+# Bayesian peak timing
+```{r}
+pred.df <- data.frame(ice_off_anomaly = c(rep(early.anomaly), rep(0), rep(late.anomaly)),
+                      location = "Green") %>%
+    mutate(row = row_number()) %>% 
+    mutate(ice_off_f =  ifelse(ice_off_anomaly == early.anomaly, "Early", "Normal"),
+           ice_off_f =  ifelse(ice_off_anomaly == late.anomaly, "Late", ice_off_f))
+
+# Models to loop through
+iters <- names(models)
+
+timing.cis <- data.frame(group = character(0), 
+                   numeric = numeric(0),
+                   timing = character(0),
+                   median = numeric(0),
+                   lower.95 = numeric(0),
+                   upper.95 = numeric(0),
+                   lower.75 = numeric(0),
+                   upper.75 = numeric(0))
+
+for (i in 1:length(iters)) {
+  model = models[[iters[i]]]
+  
+  # Use posterior dist of the mean to get posterior fitted values
+  sims <- fitted_samples(model, exclude = c('s(year_f)'),
+                         newdata = pred.df, n = 1000, seed = 1024) |>
+    left_join(pred.df |> select(row, ice_off_anomaly, ice_off_f), 
+              by = join_by(row == row)) #%>%
+  
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  early <- sims %>% filter(ice_off_anomaly == early.anomaly) 
+  early.quant <- quantile(early$fitted, probs = c(.025,.975))
+  early.quant.75 <- quantile(early$fitted, probs = c(.125, .875))
+  early.median <- median(early$fitted)
+
+  # Get the peak timing when the ice off anomaly is big (ice-off happens late)
+  late <- sims %>% filter(ice_off_anomaly == late.anomaly) 
+  late.quant <- quantile(late$fitted, probs = c(.025,.975))
+  late.quant.75 <- quantile(late$fitted, probs = c(.125, .875))
+  late.median <- median(late$fitted)
+  
+  average <- sims %>% filter(ice_off_anomaly == 0)
+  average.quant <- quantile(average$fitted, probs = c(.025,.975))
+  average.quant.75 <- quantile(average$fitted, probs = c(.125, .875))
+  average.median <- median(average$fitted)
+
+  # Get the difference between peak timings
+  diff.early <- early$fitted - average$fitted
+  diff.earlymedian <- median(diff.early)
+  diff.earlyquant <- quantile(diff.early, probs = c(.025,.975))
+  diff.earlyquant.75 <- quantile(diff.early, probs = c(.125, .875))
+  
+  diff.late <- late$fitted - average$fitted
+  diff.latemedian <- median(diff.late)
+  diff.latequant <- quantile(diff.late, probs = c(.025,.975))
+  diff.latequant.75 <- quantile(diff.late, probs = c(.125, .875))
+
+  # Make new data frame to rbind to big data frame
+  df <- data.frame(group = iters[[i]], 
+                   numeric = i,
+                   timing = c("Early", "Late", "Average", "Early Difference", "Late Difference"),
+                   median = c(early.median, late.median, average.median, 
+                              diff.earlymedian, diff.latemedian),
+                   lower.95 = c(early.quant[1], late.quant[1], average.quant[1],
+                                diff.earlyquant[1], diff.latequant[1]),
+                   upper.95 = c(early.quant[2], late.quant[2], average.quant[2]
+                                , diff.earlyquant[2], diff.latequant[2]),
+                   lower.75 = c(early.quant.75[1], late.quant.75[1], average.quant.75[1],
+                                diff.earlyquant.75[1], diff.latequant.75[1]),
+                   upper.75 = c(early.quant.75[2], late.quant.75[2], average.quant.75[2],
+                                diff.earlyquant.75[2], diff.latequant.75[2]))
+  
+  timing.cis <- rbind(timing.cis, df)
+}
+
+
+row.names(timing.cis) <- NULL
+
+timing.cis.plot <- timing.cis %>%
+  mutate(jit = ifelse(timing == "Early", -0.15, 0.15),
+         jit = ifelse(timing == "Average", 0, jit),
+         jit = ifelse(timing == "Early Difference", -0.15, jit),
+         axis.label = as.factor(ifelse(group == "peak", "Spawning Peak", "Spawning Start")))
+
+#write.csv(timing.cis.plot, "./data/wae_spawning_modeled.csv", row.names = F)
+
+
+timing.cis.plot %>%
+  filter(!grepl("Difference", timing)) %>%
+  mutate(numeric = ifelse(numeric == 2, 1.5, numeric)) %>%
+  ggplot() + 
+  geom_point(aes(x = median, y = (numeric + jit), color = timing), size = 2) + 
+  geom_segment(aes(y = (numeric + jit), yend = (numeric + jit), 
+                   x = lower.95, xend = upper.95, color = timing)) +
+  geom_segment(aes(y = (numeric + jit), yend = (numeric + jit), 
+                   x = lower.75, xend = upper.75, color = timing), linewidth = 1.5) +
+  theme_classic() +
+  labs(y = "",
+       x = "Julian Day Peak Spawning Occurs", color = "Ice-off Anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_color_manual(values = c("#0000FF", "#000000", "#FF0000")) +
+  scale_y_continuous(breaks = c(1, 1.5), labels = levels(timing.cis.plot$axis.label)) +
+  scale_x_continuous(breaks = seq(100, 135, by = 15))
+
+#ggsave("./figures/peak_density_zoop.jpeg", height = 8, width = 8)
+
+
+timing.cis.plot %>%
+  filter(grepl("Difference", timing)) %>%
+  mutate(numeric = ifelse(numeric == 2, 1.2, numeric)) %>%
+  ggplot() + 
+  geom_point(aes(x = median, y = (numeric)), size = 2) + 
+  geom_segment(aes(y = (numeric ), yend = (numeric), 
+                   x = lower.95, xend = upper.95)) +
+  geom_segment(aes(y = (numeric), yend = (numeric), 
+                   x = lower.75, xend = upper.75), linewidth = 1.5) +
+  geom_vline(xintercept = c(0), linetype = "dotted") +
+  #facet_grid(group ~., switch = "y") +
+  theme_classic() +
+  labs(y = "",
+       x = "Difference in peak timing from early and late anomaly") +
+  theme(panel.grid.major.x = element_line(),
+        panel.grid.minor.x = element_line(),
+        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
+        plot.title = element_text(angle = 0, size = 14, face = 2),
+        strip.placement = "outside",
+        strip.background = element_blank(),
+        axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) +
+  scale_y_continuous(breaks = c(1, 1.2), labels = levels(timing.cis.plot$axis.label)) +
+  scale_x_continuous(breaks = seq(-20, 15, by = 5))
+
+#ggsave("./figures/spawning_diff_wae.jpeg", height = 2, width = 8)
+```
+
+
+#  Plot Walleye peak spawning
+```{r}
+pred.df = data.frame(
+  ice_off_anomaly = seq(-18, 16, by = 0.5),
+  location = "boy river") %>%
+  mutate(row = row_number())
+
+fs <- fitted_samples(spawning_model_peak, data = pred.df, n = 1000, seed = 1024,
+                       exclude = c('s(location)')) |>
+    left_join(pred.df |> select(row, ice_off_anomaly), 
+              by = join_by(row == row)) %>%
+    drop_na() %>% 
+  mutate(group = as.numeric(draw))
+
+fv <- fitted_values(spawning_model_peak, data = pred.df, exclude = c('s(location)'))
+
+fv %>% 
+  ggplot(aes(x = ice_off_anomaly, y = fitted)) +
+  #geom_ribbon(aes(ymin = lower, ymax = upper, fill = age_f), alpha = 0.1) +
+  geom_line(data = fv, aes(x = ice_off_anomaly, y = fitted)) + 
+  labs(color = 'Fish age', fill = 'Fish age' , 
+       x ="Ice-Off anomaly", y = "Fitted values") +
+  theme(axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) + theme_classic()
+
+fig <- fs %>%
+  ggplot() +
+  #geom_ribbon(aes(ymin = lower, ymax = upper), alpha = 0.1) +
+  geom_line(data = fv, aes(x = ice_off_anomaly, y = fitted), size = 1.5) + 
+  geom_line(aes(x = ice_off_anomaly, y = fitted, group = group), alpha = 0.01) + 
+  labs(x ="Ice-off Anomaly", y = "Walleye Peak Spawning DOY") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) + 
+  scale_x_continuous(breaks = c(-15, -10, -5, 0, 5, 10, 15)) + 
+  theme(plot.margin=grid::unit(c(0,0,0,25), "mm"))
+fig
+
+write_rds(fig, "./figures/fig3A.rds")
+# Figure 3A
+ggsave("./figures/Figure3A.jpeg", width = 10, height = 10)
+```
+
+
+
+### Graveyard ###
+# Plot Walleye peak spawning
+```{r, eval = F}
+smooth <- smooth_estimates(spawning_model_peak)
+sm <- smooth %>%
+  filter(smooth == "s(ice_off_anomaly)" ) %>%
+  add_confint() %>%
+  add_constant(coef(spawning_model_peak)["(Intercept)"]) %>% 
+  mutate(upper_ci = upper_ci + coef(spawning_model_peak)["(Intercept)"],
+         lower_ci = lower_ci + coef(spawning_model_peak)["(Intercept)"])
+  
+temp_residuals <- spawning_model_peak$model %>% 
+  add_partial_residuals(spawning_model_peak) %>%
+  add_constant(coef(spawning_model_peak)["(Intercept)"], column = 4) 
+  
+fig <- sm %>% filter(smooth == "s(ice_off_anomaly)" ) %>%
+    ggplot(aes(x = ice_off_anomaly, y = est)) +
+    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
+               alpha = 0.1,
+               data = temp_residuals) +
+    geom_line(lwd = 1.5) +
+    geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
+    theme_classic() +
+    labs(y = "Walleye Peak Spawning DOY", x = "Ice-Off Anomaly") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16))# +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 2.1))
+fig
+```

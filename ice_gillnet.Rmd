@@ -1,0 +1,645 @@
+---
+title: "ice_gn"
+author: "Chris R"
+date: "5/24/2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(sf)
+library(mgcv)
+library(arrow)
+library(gratia)
+library(mnsentinellakes) #https://github.com/mnsentinellakes/mnsentinellakes
+select <- dplyr::select
+options(scipen = 999)
+set.seed(1024)
+
+early.anomaly = -17.52
+late.anomaly = 14
+```
+
+
+# Read in some ice data
+```{r}
+ice_off <- read.csv("./data/ice_off_summarized.csv") %>% mutate(lake.id = DOW)
+
+long_term <- ice_off %>% group_by(DOW) %>% count() %>% filter(n >= 100)
+
+# Calulate average ice off long term
+average <- ice_off %>% dplyr::filter(DOW %in% long_term$DOW) %>% 
+  filter(year <= 1970) %>%
+  group_by(DOW) %>% summarise(mean_ice_off = mean(min_ice_off_julian))
+
+anomaly <- average %>% merge(ice_off, by = "DOW") %>% filter(year > 1970) %>%
+  mutate(anomaly =  min_ice_off_julian - mean_ice_off) %>%
+  group_by(year) %>%
+  summarize(ice_off_anomaly = mean(anomaly), 
+            sd_anomaly = sd(anomaly))
+
+long_ice <- ice_off %>% group_by(DOW) %>% 
+  count() %>% filter(n > 50)
+```
+
+
+# Model data prepared
+```{r}
+gn_spatial <- read.csv("./data/gillnet_aged_lake_year.csv") %>%
+  mutate( lake.id = as.numeric(as.character(lake.id)),
+    lake.id = fixlakeid(ifelse(lake.id == "73020002", "73020000", lake.id)),
+    birth.year = year - est.age,
+    year_class = as.factor(str_c(lake.id, birth.year)),
+    year_f = as.factor(year), 
+    birth.year = year - est.age,
+    age_f = as.factor(est.age))
+
+
+# Year specific ice anomaly (not lake-year specific)
+walleye_anomaly_ice <- gn_spatial %>%
+  merge(y = anomaly, by.x = "birth.year", by.y = "year") %>%
+  filter(est.age >= 2) %>%
+  filter(est.age < 13) %>%
+  select(lake.id, lake.name, year, birth.year, est.age, sampling.method, 
+         total.effort.1, count, cpue, 
+         ice_off_anomaly, x, y, acres, shore_mi, non.fry, year_f, jd, effort.ident) %>%
+  mutate(non.fry = ifelse(is.na(non.fry), 0, non.fry),
+         lake.id = as.factor(lake.id)) %>%
+  filter(non.fry <= 1) 
+```
+
+
+# Characteristics of dataset
+```{r}
+walleye_anomaly_ice %>% group_by(lake.id, year) %>% count()
+# number of rows = number of surveys
+min(walleye_anomaly_ice$year); max(walleye_anomaly_ice$year)
+
+length(unique(walleye_anomaly_ice$lake.id)) # Number of lakes surveyed = 751
+length(unique(walleye_anomaly_ice$effort.ident)) # Number of total surveys = 3913
+
+surveys_per_lake <- walleye_anomaly_ice %>% group_by(lake.id, year) %>% count() %>% group_by(lake.id) %>% count()
+median(surveys_per_lake$n)
+```
+
+
+#######NEW SECTION########
+
+# Model walleye year classes by ice in first year
+```{r}
+# Final model!
+gn.ice.gam <- gam(count ~ s(est.age) + s(ice_off_anomaly) + s(jd) + s(log(acres)) +
+                    s(x, y) + s(lake.id, bs = "re") + s(year_f, bs = "re") +
+                    offset(log(total.effort.1)), 
+                  family = nb(link = "log"), 
+                  select = T, method = "REML", data = walleye_anomaly_ice)
+#write_rds(gn.ice.gam, "./models/gillnet.recruitment.anomaly.gam.rds")
+
+#gn.ice.gam <- read_rds("./models/gillnet.recruitment.anomaly.gam.rds")
+
+summary(gn.ice.gam)
+#k.check(gn.ice.gam)
+#
+gratia::appraise(gn.ice.gam)
+#
+gratia::draw(gn.ice.gam, select = 2)
+#gratia::draw(gn.ice.gam)
+```
+
+
+# Plot Walleye gill net recruitment
+```{r}
+smooth <- smooth_estimates(gn.ice.gam)
+sm <- smooth %>%
+  filter(smooth == "s(ice_off_anomaly)" ) %>%
+  add_confint() %>%
+  add_constant(coef(gn.ice.gam)["(Intercept)"]) %>% 
+  mutate(upper_ci = gn.ice.gam$family$linkinv(upper_ci + coef(gn.ice.gam)["(Intercept)"]),
+         lower_ci = gn.ice.gam$family$linkinv(lower_ci + coef(gn.ice.gam)["(Intercept)"])) %>%
+  transform_fun(inv_link(gn.ice.gam)) 
+  
+temp_residuals <- gn.ice.gam$model %>% 
+  add_partial_residuals(gn.ice.gam) %>%
+  add_constant(coef(gn.ice.gam)["(Intercept)"], column = 12) %>%
+  transform_fun(inv_link(gn.ice.gam), column = 12) %>%
+  filter(`s(ice_off_anomaly)` < 2) 
+  
+fig <- sm %>% filter(smooth == "s(ice_off_anomaly)" ) %>%
+    ggplot(aes(x = ice_off_anomaly, y = est)) +
+    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
+               alpha = 0.1,
+               data = temp_residuals) +
+    geom_line(lwd = 1.5) +
+    geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
+    theme_classic() +
+    labs(y = "Age class specific \nwalleye abundance", x = "Ice-Off Anomaly") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16))# +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 2.1))
+fig
+# Figure 4
+ggsave("./figures/Figure4.jpeg", width = 10, height = 10)
+```
+
+
+# Get estimates of decrease in year-class
+```{r}
+data_to_predict <- walleye_anomaly_ice %>% 
+  select(est.age, ice_off_anomaly, jd, acres,x, y, total.effort.1) %>%
+  summarize(across(everything(), ~median(.x, na.rm = T)))
+
+df.results <- data.frame(average = numeric(0), low = numeric(0), high = numeric(0), 
+                         age = numeric(0))
+
+rmvn <- function(n, mu, sig) { ## MVN random deviates 
+    L <- mroot(sig);
+    m <- ncol(L); 
+    t(mu + L%*%matrix(rnorm(m * n), m, n)) 
+} 
+
+for (age in 2:12){
+  newd <- data.frame(ice_off_anomaly = c(-17.52, 0, 14), acres = data_to_predict$acres,
+                     x = data_to_predict$x, y = data_to_predict$y, 
+                     est.age = age, jd = data_to_predict$jd, total.effort.1 = data_to_predict$total.effort.1, 
+                     lake.id = "10005900", year_f = 2010)
+  
+  predicted = predict(gn.ice.gam, newd, type = "response", 
+                exclude = c("s(lake.id)", "s(year_f)"))
+  
+  Xp <- predict(gn.ice.gam, newd, type = "lpmatrix", 
+                exclude = c("s(lake.id)", "s(year_f)") )
+  
+  
+  br <- rmvn(1000, coef(gn.ice.gam), gn.ice.gam$Vp) ## 1000 replicate param. vectors 
+  
+  early.ice.off <- rep(0, 1000)
+  normal.ice.off <- rep(0, 1000)
+  late.ice.off <- rep(0, 1000)
+  percent.early.normal <- rep(0, 1000)
+  percent.early.late <- rep(0, 1000)
+  diff.early.normal <- rep(0,1000)
+  diff.early.late <- rep(0,1000)
+
+  
+  for (i in 1:1000) { 
+    pr <- Xp %*% br[i,] ## replicate predictions 
+    early.ice.off[i] = exp(pr[1,])
+    normal.ice.off[i] =  exp(pr[2,]) 
+    late.ice.off[i] =  exp(pr[3,])
+    percent.early.normal[i] = 1 - (early.ice.off[i]/normal.ice.off[i])
+    percent.early.late[i] = 1 - (early.ice.off[i]/late.ice.off[i])
+    diff.early.normal[i] <- early.ice.off[i] - normal.ice.off[i]
+    diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
+  } 
+  
+  temp <- data.frame(average = c(median(early.ice.off), median(normal.ice.off), median(late.ice.off),
+                                 median(1 - (early.ice.off/normal.ice.off), na.rm = T)*100,
+                                 median(1 - (early.ice.off/late.ice.off), na.rm = T)*100,
+                                 median(early.ice.off - normal.ice.off, na.rm = T), 
+                                 median(early.ice.off - late.ice.off, na.rm = T)),
+                     low = c(quantile(early.ice.off, na.rm = T, probs = 0.025),
+                             quantile(normal.ice.off, na.rm = T, probs = 0.025),
+                             quantile(late.ice.off, na.rm = T, probs = 0.025),
+                             quantile(1 - (early.ice.off/normal.ice.off), na.rm = T, probs = c(0.025))*100,
+                             quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025))*100,
+                             quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.025)),
+                             quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.025))),
+                     high = c(quantile(early.ice.off, na.rm = T, probs = 0.975),
+                             quantile(normal.ice.off, na.rm = T, probs = 0.975),
+                             quantile(late.ice.off, na.rm = T, probs = 0.975),
+                             quantile(1 - (early.ice.off/normal.ice.off), na.rm = T, probs = c(0.975))*100,
+                             quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.975))*100,
+                             quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.975)), 
+                             quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.975))), 
+                     age = age, 
+                     difference = c("early", "normal", "late", "percent-early-normal", 
+                                    "percent-early-late", "early-normal", "early-late")
+                     )
+  df.results = rbind(df.results, temp)
+}
+# Average percent decrease (negative means increase)
+normal.percent <- df.results %>% filter(difference == "percent-early-normal") %>% select(-difference)
+colMeans(normal.percent)
+
+late.percent <- df.results %>% filter(difference == "percent-early-late") %>% select(-difference)
+colMeans(late.percent)
+
+
+# Average fish per net
+normal <- df.results %>% filter(difference == "normal") %>% select(-difference)
+normal.ice.fish <- colSums(normal)/data_to_predict$total.effort.1
+
+early <- df.results %>% filter(difference == "early") %>% select(-difference)
+early.ice.fish <- colSums(early)/data_to_predict$total.effort.1
+
+late <- df.results %>% filter(difference == "late") %>% select(-difference)
+late.ice.fish <- colSums(late)/data_to_predict$total.effort.1
+
+early.ice.fish
+
+normal.ice.fish
+
+late.ice.fish
+
+# Average decline in fish per net
+early.vs.normal <- df.results %>% filter(difference == "early-normal") %>% select(-difference)
+early.vs.late <- df.results %>% filter(difference == "early-late") %>% select(-difference)
+# Early ice-off decline vs normal ice-off
+colSums(early.vs.normal)/data_to_predict$total.effort.1
+# Early ice-off decline vs late ice-off
+colSums(early.vs.late)/data_to_predict$total.effort.1
+```
+
+
+#######NEW SECTION########
+
+# Lake specific ice off anomalies
+```{r}
+long_ice_off <- ice_off %>% filter(DOW %in% long_ice$DOW)
+
+mean_ice <- long_ice_off %>% group_by(DOW) %>% 
+  dplyr::filter(year < 1980) %>%
+  summarise(mean_ice_off = mean(min_ice_off_julian))
+
+long_ice_anomaly = merge(x = mean_ice, y = long_ice_off, by = "DOW", all.x = T) %>%
+  mutate(ice_off_anomaly = max_ice_off_julian - mean_ice_off,
+         lake.id = mnsentinellakes::fixlakeid(DOW)) %>% 
+  filter(year > 1980) %>% 
+  dplyr::select(lake.id, year, max_ice_off_julian, ice_off_anomaly)
+
+walleye_anomaly_ice_lake_specific <- gn_spatial %>%
+  merge(y = long_ice_anomaly, by.x = c("lake.id", "birth.year"), by.y = c("lake.id", "year")) %>%
+  mutate(log_acres = log(acres), 
+         lake.id = as.factor(as.character(lake.id)),
+         year_f = as.factor(as.character(year_f)),
+         non.fry = ifelse(is.na(non.fry), 0, non.fry)) %>%
+  select(lake.id, lake.name,  year, birth.year, est.age, sampling.method, 
+         total.effort.1, count, cpue, 
+         ice_off_anomaly, x, y, log_acres, shore_mi, non.fry, year_f, jd, effort.ident) %>% 
+  filter(est.age >= 2) %>%
+  filter(est.age < 13) %>%
+  filter(non.fry <= 1)
+
+# Negative = early ice off
+with(walleye_anomaly_ice_lake_specific, hist(x = ice_off_anomaly))
+
+length(unique(walleye_anomaly_ice_lake_specific$lake.id))
+range(walleye_anomaly_ice_lake_specific$year)
+```
+
+
+# Model walleye year classes by ice in first year with lake specific ice
+```{r}
+gn.ice.gam.lake.specific <- gam(count ~ s(est.age) + s(ice_off_anomaly, k = 5) + s(jd) + 
+                                  s(log_acres) +
+                    s(lake.id, bs = "re") + s(year_f, bs = "re") + offset(log(total.effort.1)), 
+                  family = nb(link = "log"), select = T, method = "REML", 
+                  data = walleye_anomaly_ice_lake_specific)
+
+#
+write_rds(gn.ice.gam.lake.specific, "./models/gillnet.recruitment.anomaly.lakespecific.gam.rds")
+#gn.ice.gam.lake.specific <- read_rds("./models/gillnet.recruitment.anomaly.lakespecific.gam.rds")
+
+#gratia::appraise(gn.ice.gam.lake.specific)
+#k.check(gn.ice.gam.lake.specific)
+#summary(gn.ice.gam.lake.specific)
+#gratia::draw(gn.ice.gam.lake.specific, select = 2)
+#rm(gn.ice.gam.lake.specific)
+```
+
+
+# Plot lake specific ice anomalies
+```{r}
+
+smooth <- smooth_estimates(gn.ice.gam.lake.specific)
+sm <- smooth %>%
+  filter(smooth == "s(ice_off_anomaly)") %>%
+  add_constant(coef(gn.ice.gam.lake.specific)[1]) %>% 
+  add_confint()  %>%
+  mutate(upper_ci = gn.ice.gam.lake.specific$family$linkinv(upper_ci),
+         lower_ci = gn.ice.gam.lake.specific$family$linkinv(lower_ci)) %>%
+  transform_fun(inv_link(gn.ice.gam.lake.specific)) 
+  
+temp_residuals <- gn.ice.gam.lake.specific$model %>% 
+  add_partial_residuals(gn.ice.gam.lake.specific) %>%
+  add_constant(coef(gn.ice.gam.lake.specific)[1], column = 12) %>%
+  transform_fun(inv_link(gn.ice.gam.lake.specific), column = 12)
+  
+fig <- sm %>% filter(smooth == "s(ice_off_anomaly)" ) %>%
+    ggplot(aes(x = ice_off_anomaly, y = est)) +
+    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
+               alpha = 0.1,
+               data = temp_residuals) +
+    geom_line(lwd = 1.5) +
+    geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
+    theme_classic() +
+    labs(y = "Age class specific \nwalleye recruitment", x = "Ice-Off Anomaly") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16)) +
+  ylim(0, 2.5)
+fig
+# Figure S2
+ggsave("./figures/FigureS2.jpeg", width = 10, height = 10)
+```
+
+
+
+# Get estimates of decrease in year-class (lake-specific)
+```{r}
+data_to_predict <- walleye_anomaly_ice_lake_specific %>% 
+  select(est.age, ice_off_anomaly, jd, log_acres,x, y, total.effort.1) %>%
+  summarize(across(everything(), ~median(.x, na.rm = T)))
+
+df.results <- data.frame(average = numeric(0), low = numeric(0), high = numeric(0), 
+                         age = numeric(0))
+
+rmvn <- function(n, mu, sig) { ## MVN random deviates 
+    L <- mroot(sig);
+    m <- ncol(L); 
+    t(mu + L %*% matrix(rnorm(m * n), m, n)) 
+} 
+
+for (age in 2:12){
+  newd <- data.frame(ice_off_anomaly = c(-17.52, 0, 14), log_acres = data_to_predict$log_acres,
+                     x = data_to_predict$x, y = data_to_predict$y, 
+                     est.age = age, jd = data_to_predict$jd, total.effort.1 = data_to_predict$total.effort.1, 
+                     lake.id = "40011700", year_f = 2010)
+  
+  predicted = predict(gn.ice.gam.lake.specific, newd, type = "response", 
+                exclude = c("s(lake.id)", "s(year_f)"))
+  
+  Xp <- predict(gn.ice.gam.lake.specific, newd, type = "lpmatrix", 
+                exclude = c("s(lake.id)", "s(year_f)") )
+  
+  
+  br <- rmvn(1000, coef(gn.ice.gam.lake.specific), gn.ice.gam.lake.specific$Vp) ## 1000 replicate param. vectors 
+  
+  early.ice.off <- rep(0, 1000)
+  normal.ice.off <- rep(0, 1000)
+  late.ice.off <- rep(0, 1000)
+  percent.early.normal <- rep(0, 1000)
+  percent.early.late <- rep(0, 1000)
+  diff.early.normal <- rep(0,1000)
+  diff.early.late <- rep(0,1000)
+
+  
+  for (i in 1:1000) { 
+    pr <- Xp %*% br[i,] ## replicate predictions 
+    early.ice.off[i] = exp(pr[1,])
+    normal.ice.off[i] =  exp(pr[2,]) 
+    late.ice.off[i] =  exp(pr[3,])
+    percent.early.normal[i] = 1 - (early.ice.off[i]/normal.ice.off[i])
+    percent.early.late[i] = 1 - (early.ice.off[i]/late.ice.off[i])
+    diff.early.normal[i] <- early.ice.off[i] - normal.ice.off[i]
+    diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
+  } 
+  
+  temp <- data.frame(average = c(median(early.ice.off), median(normal.ice.off), median(late.ice.off),
+                                 median(1 - (early.ice.off/normal.ice.off), na.rm = T)*100,
+                                 median(1 - (early.ice.off/late.ice.off), na.rm = T)*100,
+                                 median(early.ice.off - normal.ice.off, na.rm = T), 
+                                 median(early.ice.off - late.ice.off, na.rm = T)),
+                     low = c(quantile(early.ice.off, na.rm = T, probs = 0.025),
+                             quantile(normal.ice.off, na.rm = T, probs = 0.025),
+                             quantile(late.ice.off, na.rm = T, probs = 0.025),
+                             quantile(1 - (early.ice.off/normal.ice.off), na.rm = T, probs = c(0.025))*100,
+                             quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025))*100,
+                             quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.025)),
+                             quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.025))),
+                     high = c(quantile(early.ice.off, na.rm = T, probs = 0.975),
+                             quantile(normal.ice.off, na.rm = T, probs = 0.975),
+                             quantile(late.ice.off, na.rm = T, probs = 0.975),
+                             quantile(1 - (early.ice.off/normal.ice.off), na.rm = T, probs = c(0.975))*100,
+                             quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.975))*100,
+                             quantile(early.ice.off - normal.ice.off, na.rm = T, probs = c(0.975)), 
+                             quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.975))), 
+                     age = age, 
+                     difference = c("early", "normal", "late", "percent-early-normal", 
+                                    "percent-early-late", "early-normal", "early-late")
+                     )
+  df.results = rbind(df.results, temp)
+}
+# Average percent decrease (negative means increase)
+normal.percent <- df.results %>% filter(difference == "percent-early-normal") %>% select(-difference)
+colMeans(normal.percent)
+
+late.percent <- df.results %>% filter(difference == "percent-early-late") %>% select(-difference)
+colMeans(late.percent)
+
+
+# Average fish per net
+normal <- df.results %>% filter(difference == "normal") %>% select(-difference)
+normal.ice.fish <- colSums(normal)/data_to_predict$total.effort.1
+
+early <- df.results %>% filter(difference == "early") %>% select(-difference)
+early.ice.fish <- colSums(early)/data_to_predict$total.effort.1
+
+late <- df.results %>% filter(difference == "late") %>% select(-difference)
+late.ice.fish <- colSums(late)/data_to_predict$total.effort.1
+
+early.ice.fish
+
+normal.ice.fish
+
+late.ice.fish
+
+# Average decline in fish per net
+early.vs.normal <- df.results %>% filter(difference == "early-normal") %>% select(-difference)
+early.vs.late <- df.results %>% filter(difference == "early-late") %>% select(-difference)
+# Early ice-off decline vs normal ice-off
+colSums(early.vs.normal)/data_to_predict$total.effort.1
+# Early ice-off decline vs late ice-off
+colSums(early.vs.late)/data_to_predict$total.effort.1
+```
+
+
+
+#######Random other stuff########
+
+# Factor smooth by age
+```{r}
+walleye_anomaly_ice_old <- gn_spatial %>%
+  mutate(lake.id = mnsentinellakes::fixlakeid(lake.id)) %>%
+  merge(y = anomaly, by.x = "birth.year", by.y = "year") %>%
+  #merge(y = long_ice_anomaly, by.x = c("lake.id", "birth.year"), by.y = c("lake.id","year")) %>%
+  select(lake.id, lake.name, birth.year, sampling.method, total.effort.1, 
+         est.age, count, cpue, ice_off_anomaly, x, y, acres, 
+         shore_mi, non.fry, year, year_f, jd,  effort.ident) %>%
+  mutate(lake.id = as.factor(as.character(lake.id)),
+         year_f = as.factor(as.character(year_f)), 
+         age_f = as.factor(est.age), 
+         non.fry = ifelse(is.na(non.fry), 0, non.fry),) %>%
+  filter(non.fry <= 1) %>%
+  filter(est.age >= 2) %>%
+  filter(est.age < 13)
+
+# https://stats.stackexchange.com/questions/637423/conceptual-interpretation-of-bs-fs-and-by-term-in-gam
+# Model GS
+gn.ice.gam.old <- gam(count ~ s(ice_off_anomaly) + 
+                        s(ice_off_anomaly, age_f, bs = "fs") + s(x, y) + 
+                        s(jd) + s(log(acres)) +
+                    s(lake.id, bs = "re") + s(year_f, bs = "re") + offset(log(total.effort.1)), 
+                  family = nb(link = "log"), method = "fREML", data = walleye_anomaly_ice_old)
+#k.check(gn.ice.gam.old)
+#appraise(gn.ice.gam.old)
+#summary(gn.ice.gam.old) # Deviance explained = 48
+#draw(gn.ice.gam.old, select = 1)
+#draw(gn.ice.gam.old, select = 2)
+
+#write_rds(gn.ice.gam.old, "./models/gillnet.recruitment.anomaly.gam_fs.rds")
+#gn.ice.gam.old <- read_rds("./models/gillnet.recruitment.anomaly.gam_fs.rds")
+
+
+pred.df = data.frame(
+  ice_off_anomaly = seq(-18, 16, by = 0.5),
+  age_f = rep(2:12, each = 69),
+        jd = 213, acres = 9.5,
+        lake.id = "01006200", year_f = 2011, total.effort.1 = 6) %>%
+  mutate(row = row_number(), age_f = as.factor(age_f))
+
+fs <- fitted_samples(gn.ice.gam.old, data = pred.df, n = 1000, seed = 1024,
+                       exclude = c('s(lake_id)',  's(year_f)')) |>
+    left_join(pred.df |> select(row, ice_off_anomaly, age_f), 
+              by = join_by(row == row)) %>%
+    drop_na() %>% 
+  mutate(age_f = as.factor(age_f),
+         group = as.numeric(str_c(age_f, draw)))
+
+fv <- fitted_values(gn.ice.gam.old, data = pred.df)
+
+fv %>% 
+  ggplot(aes(x = ice_off_anomaly, y = fitted, group = age_f)) +
+  #geom_ribbon(aes(ymin = lower, ymax = upper, fill = age_f), alpha = 0.1) +
+  geom_line(data = fv, aes(x = ice_off_anomaly, y = fitted, group = age_f, colour = age_f)) + 
+  labs(color = 'Fish age', fill = 'Fish age' , 
+       x ="Ice-Off anomaly", y = "Fitted values") +
+  theme(axis.text.y = element_text(size = 14),
+        axis.text.x = element_text(size = 14),
+        axis.title.x = element_text(size = 16),
+        axis.title.y = element_text(size = 16),
+        legend.title = element_text(size = 14), 
+        legend.text = element_text(size = 12)
+        ) + theme_classic()
+
+fig <- fs %>%
+  ggplot(aes(x = ice_off_anomaly, y = fitted, group = group)) +
+  #geom_ribbon(aes(ymin = lower, ymax = upper, fill = age_f), alpha = 0.1) +
+  geom_line(data = fv, aes(x = ice_off_anomaly, y = fitted, 
+                           group = age_f, colour = age_f), size = 1.5) + 
+  geom_line(aes(colour = age_f), alpha = 0.001) + 
+  labs(color = 'Estimated\nage', fill = 'Estimated\nage' , 
+       x ="Ice-off Anomaly", y = "Age-class Specific Recruitment") +
+  theme_classic() +
+  theme(axis.text.y = element_text(size = 16),
+        axis.text.x = element_text(size = 16),
+        axis.title.x = element_text(size = 18),
+        axis.title.y = element_text(size = 18),
+        legend.title = element_text(size = 16), 
+        legend.text = element_text(size = 14)) + 
+  scale_color_brewer(palette = "BrBG") + 
+  theme(plot.margin=grid::unit(c(0,0,0,25), "mm"))
+fig
+#write_rds(fig, "./figures/fig3C.rds")
+# Figure 3C
+#ggsave("./figures/Figure3C.jpeg", width = 10, height = 10)
+```
+
+
+# Combine to make figure 3
+```{r}
+fig3A <- readRDS("./figures/fig3A.rds")
+fig3B <- readRDS("./figures/fig3B.rds")
+fig3C <- readRDS("./figures/fig3C.rds")
+
+plot_grid(fig3A, fig3B, fig3C, labels = "auto", ncol = 1)
+ggsave("./figures/figure3.jpeg", height = 14, width = 8)
+```
+
+
+```{r}
+smooth <- smooth_estimates(gn.ice.gam.old)
+sm <- smooth %>% 
+  #filter(smooth == "s(ice_off_anomaly,age_f)" ) %>%
+  #filter(smooth == "s(ice_off_anomaly)" ) %>%
+  add_confint() %>%
+  add_constant(coef(gn.ice.gam.old)["(Intercept)"]) %>% 
+  mutate(upper_ci = upper_ci + coef(gn.ice.gam.old)["(Intercept)"],
+         lower_ci = lower_ci + coef(gn.ice.gam.old)["(Intercept)"]) %>%
+  transform_fun(inv_link(gn.ice.gam.old))
+  
+temp_residuals <- gn.ice.gam.old$model %>% 
+  add_partial_residuals(gn.ice.gam.old) %>%
+  add_constant(coef(gn.ice.gam.old)["(Intercept)"], column = 12) %>%
+  transform_fun(inv_link(gn.ice.gam.old), column = 12) #%>%
+  #filter(`s(ice_off_anomaly)` < 2) 
+  
+fig <- sm %>%   filter(smooth == "s(ice_off_anomaly,age_f)" ) %>%
+    ggplot(aes(x = ice_off_anomaly, y = est, color = age_f, group = age_f)) +
+    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
+               alpha = 0.1,
+               data = temp_residuals) +
+    geom_line(lwd = 1.5) +
+    #geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
+    theme_classic() +
+    labs(y = "Age class specific \nwalleye abundance", x = "Ice-Off Anomaly", color = "Age") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16)) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 2.1))
+fig
+
+sm %>% filter(smooth == "s(ice_off_anomaly)" ) %>%
+    ggplot(aes(x = ice_off_anomaly, y = est, color = age_f, group = age_f)) +
+    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
+               alpha = 0.1,
+               data = temp_residuals) +
+    geom_line(lwd = 1.5) +
+    #geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
+    theme_classic() +
+    labs(y = "Age class specific \nwalleye abundance", x = "Ice-Off Anomaly", color = "Age") +
+    theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 16)) +
+    scale_y_continuous(expand = c(0, 0), limits = c(0, 2.1))
+```
+
+
+
+# Map
+```{r}
+mn_state <- map_data("state", "Minnesota")
+mn_counties <- map_data("county", "Minnesota")
+
+plot_ids_age <- walleye_anomaly_ice %>% 
+  group_by(lake.id, year, total.effort.1) %>% count()
+
+plot_ids <- plot_ids_age %>% 
+  group_by(lake.id) %>% count() %>% filter(n > 4)
+sum(plot_ids$n)
+
+walleye_anomaly_ice %>% 
+  filter(lake.id %in% plot_ids$lake.id) %>%
+  group_by(lake.id) %>%
+  summarise(n = n(), 
+            lat = unique(y),
+            long = unique(x)) %>%
+  ggplot() + 
+  geom_polygon(data = mn_state, 
+               aes(x = long, y = lat, group = group), 
+               colour="black", fill="NA", lwd=1 )  + 
+  geom_polygon(data = mn_counties, aes(x = long, y = lat, group = group), 
+               alpha = 0.5, fill = "white", color = "black") +
+  coord_fixed(1.3) +
+  geom_point(aes(x = long, y = lat, size = n), 
+             pch = 21, alpha = 0.5, color = "black", fill = "black") +
+  scale_size_continuous(breaks = c(6, 15, 25)) +
+  theme(plot.title = element_text(hjust = 0.5, size = 18),
+        plot.subtitle = element_text(hjust = 0.5),
+        legend.title = element_text(size = 18),
+        legend.text = element_text(size = 12),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank()) + 
+  theme(legend.position = c(.85, 0.38)) + 
+  labs(size = "Number of \nGN surveys",
+       x = "Longitude", y = "Latitude")
+#ggsave("./figures/gn_surveys.jpeg", width = 7, height = 7)
+```
