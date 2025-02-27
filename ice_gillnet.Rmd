@@ -47,7 +47,7 @@ anomaly <- average %>% merge(ice_off, by = "DOW") %>% filter(year > 1970) %>%
             sd_anomaly = sd(anomaly))
 
 long_ice <- ice_off %>% group_by(DOW) %>% 
-  count() %>% filter(n > 50)
+  count() %>% filter(n > 40)
 ```
 
 
@@ -65,15 +65,19 @@ gn_spatial <- read.csv("./data/gillnet_aged_lake_year.csv") %>%
 
 # Year specific ice anomaly (not lake-year specific)
 walleye_anomaly_ice <- gn_spatial %>%
+  mutate(lake.id = mnsentinellakes::fixlakeid(lake.id)) %>%
   merge(y = anomaly, by.x = "birth.year", by.y = "year") %>%
+  select(lake.id, lake.name, birth.year, sampling.method, total.effort.1, 
+         est.age, count, cpue, ice_off_anomaly, x, y, acres, 
+         shore_mi, non.fry, year, year_f, jd,  effort.ident) %>%
+  mutate(log_acres = log(acres), 
+         lake.id = as.factor(as.character(lake.id)),
+         year_f = as.factor(as.character(year_f)), 
+         age_f = as.factor(est.age), 
+         non.fry = ifelse(is.na(non.fry), 0, non.fry),) %>%
+  filter(non.fry <= 1) %>%
   filter(est.age >= 2) %>%
-  filter(est.age < 13) %>%
-  select(lake.id, lake.name, year, birth.year, est.age, sampling.method, 
-         total.effort.1, count, cpue, 
-         ice_off_anomaly, x, y, acres, shore_mi, non.fry, year_f, jd, effort.ident) %>%
-  mutate(non.fry = ifelse(is.na(non.fry), 0, non.fry),
-         lake.id = as.factor(lake.id)) %>%
-  filter(non.fry <= 1) 
+  filter(est.age < 13)
 ```
 
 
@@ -93,21 +97,6 @@ median(surveys_per_lake$n)
 
 # Factor smooth by age
 ```{r}
-walleye_anomaly_ice <- gn_spatial %>%
-  mutate(lake.id = mnsentinellakes::fixlakeid(lake.id)) %>%
-  merge(y = anomaly, by.x = "birth.year", by.y = "year") %>%
-  select(lake.id, lake.name, birth.year, sampling.method, total.effort.1, 
-         est.age, count, cpue, ice_off_anomaly, x, y, acres, 
-         shore_mi, non.fry, year, year_f, jd,  effort.ident) %>%
-  mutate(log_acres = log(acres), 
-         lake.id = as.factor(as.character(lake.id)),
-         year_f = as.factor(as.character(year_f)), 
-         age_f = as.factor(est.age), 
-         non.fry = ifelse(is.na(non.fry), 0, non.fry),) %>%
-  filter(non.fry <= 1) %>%
-  filter(est.age >= 2) %>%
-  filter(est.age < 13)
-
 # https://stats.stackexchange.com/questions/637423/conceptual-interpretation-of-bs-fs-and-by-term-in-gam
 # Model GS
 gn.ice.gam <- gam(count ~ s(ice_off_anomaly) + 
@@ -280,13 +269,13 @@ newd <- data.frame(ice_off_anomaly = c(-17.52, 0, 14), acres = data_to_predict$l
                    total.effort.1 = data_to_predict$total.effort.1, 
                    lake.id = "40011700", year_f = 2010)
   
-predicted = predict(gn.ice.gam.old, newd, type = "response", 
+predicted = predict(gn.ice.gam, newd, type = "response", 
                 exclude = c("s(lake.id)", "s(year_f)"))
   
-Xp <- predict(gn.ice.gam.old, newd, type = "lpmatrix", 
+Xp <- predict(gn.ice.gam, newd, type = "lpmatrix", 
                 exclude = c("s(lake.id)", "s(year_f)") )
   
-br <- rmvn(1000, coef(gn.ice.gam.old), gn.ice.gam.old$Vp) ## 1000 replicate param. vectors 
+br <- rmvn(1000, coef(gn.ice.gam), gn.ice.gam$Vp) ## 1000 replicate param. vectors 
   
 early.ice.off <- rep(0, 1000)
 normal.ice.off <- rep(0, 1000)
@@ -308,28 +297,31 @@ for (i in 1:1000) {
   diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
 } 
 
-# Early ice-off recruitment to age-4
+# Early ice-off recruitment to age-6
 median(early.ice.off)
 quantile(early.ice.off, na.rm = T, probs = c(0.025, 0.975))
          
-# Normal ice-off recruitment to age-4
+# Normal ice-off recruitment to age-6
 median(normal.ice.off) 
 quantile(normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
 
-# Late ice-off recruitment to age-4
+# Late ice-off recruitment to age-6
 median(late.ice.off)
 quantile(late.ice.off, na.rm = T, probs = c(0.025, 0.975))
                 
                  
 # Percent decrease in recruitment from early to normal ice-off (pos = increase)
-median(percent.early.normal)*100 # 13.7 % less fish
+median(percent.early.normal)*100 # 13.85948 % less fish
 quantile(percent.early.normal, na.rm = T, probs = c(0.025, 0.975))*100
+#     2.5%     97.5% 
+# 5.168807 21.168844 
 
 
 # Percent decrease in recruitment from early to late ice-off (pos = increase)
-median(percent.early.late)*100 # 19.9 % less fish
+median(percent.early.late)*100 # 20.94502 % less fish
 quantile(percent.early.late, na.rm = T, probs = c(0.025, 0.975))*100
-
+#     2.5%     97.5% 
+# 9.028622 30.476858
                                  
 median(1 - (early.ice.off/late.ice.off), na.rm = T)*100
 quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025, 0.975))*100
@@ -343,7 +335,7 @@ quantile(early.ice.off - late.ice.off, na.rm = T, probs = c(0.025, 0.975))
 
 
 
-#######NEW SECTION########
+#######Supplement########
 
 # Lake specific ice off anomalies
 ```{r}
@@ -383,18 +375,18 @@ range(walleye_anomaly_ice_lake_specific$year)
 
 # Model walleye year classes by ice in first year with lake specific ice
 ```{r}
-gn.ice.gam.lake.specific <- gam(count ~ s(ice_off_anomaly) + s(ice_off_anomaly, age_f, bs = "fs") + s(jd) + 
-                                  s(log_acres) + s(x, y) +
-                    s(lake.id, bs = "re") + s(year_f, bs = "re") + offset(log(total.effort.1)), 
+gn.ice.gam.lake.specific <- gam(count ~ s(ice_off_anomaly) + 
+                                  s(ice_off_anomaly, age_f, bs = "fs") +
+                                  s(jd) + s(log_acres) + s(x, y) +
+                                  s(lake.id, bs = "re") + s(year_f, bs = "re") + 
+                                  offset(log(total.effort.1)), 
                   family = nb(link = "log"), select = T, method = "REML", 
                   data = walleye_anomaly_ice_lake_specific)
 
-#write_rds(gn.ice.gam.lake.specific, "./models/gillnet.recruitment.anomaly.lakespecific.gam.rds")
-#
+write_rds(gn.ice.gam.lake.specific, "./models/gillnet.recruitment.anomaly.lakespecific.gam.rds")
 gn.ice.gam.lake.specific <- read_rds("./models/gillnet.recruitment.anomaly.lakespecific.gam.rds")
 
 gratia::appraise(gn.ice.gam.lake.specific)
-k.check(gn.ice.gam.lake.specific)
 summary(gn.ice.gam.lake.specific)
 gratia::draw(gn.ice.gam.lake.specific, select =1)
 #rm(gn.ice.gam.lake.specific)
@@ -439,7 +431,6 @@ ggsave("./figures/FigureS4.jpeg", width = 10, height = 10)
 ```{r}
 age = 6
 
-
 data_to_predict <- walleye_anomaly_ice_lake_specific %>% 
   select(est.age, ice_off_anomaly, jd, log_acres, x, y, total.effort.1) %>%
   summarize(across(everything(), ~median(.x, na.rm = T)))
@@ -480,28 +471,30 @@ for (i in 1:1000) {
   diff.early.late[i] <- early.ice.off[i] - late.ice.off[i]
 } 
 
-# Early ice-off recruitment to age-4
+# Early ice-off recruitment to age-6
 median(early.ice.off)
 quantile(early.ice.off, na.rm = T, probs = c(0.025, 0.975))
          
-# Normal ice-off recruitment to age-4
+# Normal ice-off recruitment to age-6
 median(normal.ice.off) 
 quantile(normal.ice.off, na.rm = T, probs = c(0.025, 0.975))
 
-# Late ice-off recruitment to age-4
+# Late ice-off recruitment to age-6
 median(late.ice.off)
 quantile(late.ice.off, na.rm = T, probs = c(0.025, 0.975))
                 
                  
 # Percent decrease in recruitment from early to normal ice-off (pos = increase)
-median(percent.early.normal)*100 # 13.7 % less fish
+median(percent.early.normal)*100 # 5.276668 % less fish
 quantile(percent.early.normal, na.rm = T, probs = c(0.025, 0.975))*100
-
+#     2.5%     97.5% 
+#-12.62832  20.58064
 
 # Percent decrease in recruitment from early to late ice-off (pos = increase)
-median(percent.early.late)*100 # 19.9 % less fish
+median(percent.early.late)*100 # 20.71006 % less fish
 quantile(percent.early.late, na.rm = T, probs = c(0.025, 0.975))*100
-
+#      2.5%      97.5% 
+#-0.9234325 38.7497084
                                  
 median(1 - (early.ice.off/late.ice.off), na.rm = T)*100
 quantile(1 - (early.ice.off/late.ice.off), na.rm = T, probs = c(0.025, 0.975))*100

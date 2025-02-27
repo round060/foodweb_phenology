@@ -38,7 +38,7 @@ anomaly <- average %>% merge(ice_off, by = "DOW") %>% filter(year > 1980) %>%
 ```
 
 
-
+# Filter down to modeling dataset
 ```{r}
 plot(y = anomaly$average_anomaly, x = anomaly$year)
 mean(anomaly$average_anomaly)
@@ -83,7 +83,6 @@ gam.ice <- gam(catch ~ s(average_anomaly) + s(log_acres) + s(x, y) + s(julian_da
                family = nb(),
                data = efish_ice)
 #write_rds(gam.ice, "./models/yoy_ice_gam.rds")
-#
 gam.ice <- readRDS("./models/yoy_ice_gam.rds")
 appraise(gam.ice)
 gratia::draw(gam.ice)
@@ -124,7 +123,6 @@ jd_smooth %>%
   
 #ggsave("./figures/figure3.jpeg", height = 10, width = 12)
 ```
-
 
 
 # Fitted samples plot

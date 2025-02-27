@@ -670,7 +670,7 @@ cowplot::plot_grid(early.anomaly.plot, average.anomaly.plot, late.anomaly.plot,
 ```
 
 
-# Figure S7 - Bayesian peak timing - SUBSET - rate of change 
+# Figure S5 - Bayesian peak timing - SUBSET - rate of change 
 ```{r}
 subset.labels = c("Bosmina", "Calanoid", "Ceriodaphnia", "Chrysomonad", "Chydorus", "Cryptomonad", 
                   "Cyanobacteria", "Cyclopoid","Daphnia", "Diaphanosoma", "Diatom", "Dinoflagellate",
@@ -730,7 +730,8 @@ all_rate_of_change <- timing.cis.plot.all %>%
   scale_y_continuous(breaks = -1:-16, labels = subset.labels) + theme(legend.position="none")
 
 all_rate_of_change
-#ggsave("./figures/all_rate_of_change.jpeg", height = 8, width = 9)
+# Figure S5
+#ggsave("./figures/FigureS5.jpeg", height = 8, width = 9)
 ```
 
  
