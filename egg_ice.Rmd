@@ -8,12 +8,9 @@ output: html_document
 ```{r setup, include=FALSE}
 library(tidyverse)
 library(mnsentinellakes) #https://github.com/mnsentinellakes/mnsentinellakes
-library(brms)
 library(mgcv)
 library(gratia)
-library(lme4)
 library(mwlaxeref)
-library(arrow)
 library(cowplot)
 options(scipen = 999)
 
@@ -39,8 +36,6 @@ filtered_phenology %>% group_by(location, event) %>% count()
 ```{r}
 peak_spawning <- filtered_phenology %>% filter(event == "peak")
 
-with(peak_spawning, plot(ice_off_anomaly, julian_day))
-
 spawning_model_peak <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "re"), 
                            data = peak_spawning)
 appraise(spawning_model_peak)
@@ -49,8 +44,8 @@ gam.check(spawning_model_peak)
 draw(spawning_model_peak, residuals = T,)
 #ggsave("./figures/spawning_peak.jpeg", height = 7, width = 6)
 
+
 start_spawning <- filtered_phenology %>% filter(event == "start")
-with(start_spawning, plot(ice_off_anomaly, julian_day))
 spawning_model_start <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "re"), 
                             data = start_spawning)
 appraise(spawning_model_start)
@@ -230,19 +225,6 @@ fs <- fitted_samples(spawning_model_peak, data = pred.df, n = 1000, seed = 1024,
 
 fv <- fitted_values(spawning_model_peak, data = pred.df, exclude = c('s(location)'))
 
-fv %>% 
-  ggplot(aes(x = ice_off_anomaly, y = fitted)) +
-  #geom_ribbon(aes(ymin = lower, ymax = upper, fill = age_f), alpha = 0.1) +
-  geom_line(data = fv, aes(x = ice_off_anomaly, y = fitted)) + 
-  labs(color = 'Fish age', fill = 'Fish age' , 
-       x ="Ice-Off anomaly", y = "Fitted values") +
-  theme(axis.text.y = element_text(size = 14),
-        axis.text.x = element_text(size = 14),
-        axis.title.x = element_text(size = 16),
-        axis.title.y = element_text(size = 16),
-        legend.title = element_text(size = 14), 
-        legend.text = element_text(size = 12)
-        ) + theme_classic()
 
 fig <- fs %>%
   ggplot() +
@@ -257,8 +239,7 @@ fig <- fs %>%
         axis.title.y = element_text(size = 18),
         legend.title = element_text(size = 16), 
         legend.text = element_text(size = 14)) + 
-  scale_x_continuous(breaks = c(-15, -10, -5, 0, 5, 10, 15)) + 
-  theme(plot.margin=grid::unit(c(0,0,0,25), "mm"))
+  scale_x_continuous(breaks = c(-15, -10, -5, 0, 5, 10, 15))
 fig
 
 write_rds(fig, "./figures/fig3A.rds")
@@ -266,34 +247,3 @@ write_rds(fig, "./figures/fig3A.rds")
 ggsave("./figures/Figure3A.jpeg", width = 10, height = 10)
 ```
 
-
-
-### Graveyard ###
-# Plot Walleye peak spawning
-```{r, eval = F}
-smooth <- smooth_estimates(spawning_model_peak)
-sm <- smooth %>%
-  filter(smooth == "s(ice_off_anomaly)" ) %>%
-  add_confint() %>%
-  add_constant(coef(spawning_model_peak)["(Intercept)"]) %>% 
-  mutate(upper_ci = upper_ci + coef(spawning_model_peak)["(Intercept)"],
-         lower_ci = lower_ci + coef(spawning_model_peak)["(Intercept)"])
-  
-temp_residuals <- spawning_model_peak$model %>% 
-  add_partial_residuals(spawning_model_peak) %>%
-  add_constant(coef(spawning_model_peak)["(Intercept)"], column = 4) 
-  
-fig <- sm %>% filter(smooth == "s(ice_off_anomaly)" ) %>%
-    ggplot(aes(x = ice_off_anomaly, y = est)) +
-    geom_point(aes(x = ice_off_anomaly, y = `s(ice_off_anomaly)`), 
-               alpha = 0.1,
-               data = temp_residuals) +
-    geom_line(lwd = 1.5) +
-    geom_ribbon(aes(ymin = lower_ci , ymax = upper_ci), alpha = 0.3) +
-    theme_classic() +
-    labs(y = "Walleye Peak Spawning DOY", x = "Ice-Off Anomaly") +
-    theme(axis.text = element_text(size = 12),
-        axis.title = element_text(size = 16))# +
-    scale_y_continuous(expand = c(0, 0), limits = c(0, 2.1))
-fig
-```
