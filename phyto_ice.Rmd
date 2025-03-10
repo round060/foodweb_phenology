@@ -22,7 +22,10 @@ late.anomaly = 14
 
 # Read in semi cleaned data
 ````{r load in}
-phytodata.cleanish <- read.csv("./data/ramsey_county_phytoplankton.csv") 
+phytodata.cleanish <- read.csv("./data/ramsey_county_phytoplankton.csv") %>% 
+  mutate(across(c(ALL.CELLS:CHRYSOS), ~ round(.x)))
+
+
 
 ice_off <- read.csv("./data/ice_off_summarized.csv") %>%
   mutate(DNRID = fixlakeid(DOW)) %>% 
@@ -53,9 +56,7 @@ temp <- merge( phytodata.cleanish, wb.ice, by = c("year")) %>%
          ice_off_anomaly_abs = abs(ice_off_anomaly)) %>%
   # Subjective but remove early (pre-february) and late (post Decemeber) dates
   dplyr::filter(JULIANDAY > 60) %>%  
-  dplyr::filter(JULIANDAY < 330) %>%
-  mutate(ice_off_anomaly_s = scale(ice_off_anomaly),
-         JULIANDAY_s = scale(JULIANDAY)) 
+  dplyr::filter(JULIANDAY < 330)
 
 ```
 
@@ -112,7 +113,7 @@ k.check(models$DINOS)
 k.check(models$CRYPTOS)
 k.check(models$CHRYSOS)
 
-#write_rds(models, "./models/phyto.models.rds")
+write_rds(models, "./models/phyto.models.rds")
 ```
 
 # Read in model DF
@@ -183,9 +184,6 @@ species.labels <- data.frame(variable = names(models),
                           "Dinoflagellates\nDensity", "Cryptomonads\nDensity", 
                           "Chrysophytes\nDensity"))
 
-
-#all.cells.doy <- plot.phyto.doy(var.name = "ALL.CELLS") + theme(legend.position="none")
-#all.cells.doy
 cyanos.doy <- plot.phyto.doy(var.name = "CYANOS") + theme(legend.position="none")
 green.doy <- plot.phyto.doy(var.name = "GREEN") + theme(legend.position="none")
 diatom.doy <- plot.phyto.doy(var.name = "DIATOM") + theme(legend.position="none")
@@ -198,7 +196,7 @@ phyto <- plot_grid(cyanos.doy, green.doy, diatom.doy,
                             dinos.doy, cryptos.doy, chrysos.doy)
 phyto
 #Figure S8
-ggsave("./figures/FigureS8.jpeg", height = 10, width = 12)
+#ggsave("./figures/FigureS8.jpeg", height = 10, width = 12)
 ```
 
 # Peak timing
@@ -353,7 +351,7 @@ timing.cis.plot %>%
 # Figure S1
 ggsave("./figures/FigureS1.jpeg", height = 8, width = 8)
 
-#write.csv(timing.cis.plot, "./data/phyto_modeled_peak.csv", row.names = F)
+write.csv(timing.cis.plot, "./data/phyto_modeled_peak.csv", row.names = F)
 ```
 
 
@@ -396,7 +394,7 @@ for (i in 1:length(groups)) {
     mutate(row = row_number()) 
   
   sims <- fitted_samples(model, exclude = c('s(DNRID)',  's(year_f)'),
-                         newdata = pred.df, n = 1000, seed = 1024) |>
+                         data = pred.df, n = 1000, seed = 1024) |>
     left_join(pred.df |> select(row, ice_off_anomaly, JULIANDAY), 
               by = join_by(row == row))
   
@@ -434,14 +432,13 @@ bloom.size.plot %>%
                linewidth = 1.5) +
   geom_hline(yintercept = 0, linetype = 'dotted') +
   facet_wrap(vars(axis.label), scales = "free") + 
-  scale_color_manual(values = c("#FF0000", "#000000",  "#0000FF")) + 
+  scale_color_manual(values = c("#FF0000",  "#0000FF")) + 
   labs(y = "% Change in Abundance From Normal Ice-Off",
        x = "Ice-Off Timing", color = "Ice-Off Timing") +
   theme_classic() +
   theme(legend.position = c(.45, .935)) 
 
-# Figure S7
-
+# Figure S6
 ggsave("./figures/FigureS6.jpeg", height = 8, width = 9)
 ```
 

@@ -27,22 +27,22 @@ filtered_phenology <- read.csv("./data/wae_spawning_clean.csv") %>%
          year_f = as.factor(year))
 
 
-filtered_phenology %>% group_by(location, event) %>% count()
+locations <- filtered_phenology %>% group_by(location, event) %>% count() %>% filter(n > 10)
 ```
 
 
 
 # Model Spawning Phenology
 ```{r}
-peak_spawning <- filtered_phenology %>% filter(event == "peak")
+peak_spawning <- filtered_phenology %>% filter(event == "peak") %>% 
+  filter(location %in% locations$location)
 
 spawning_model_peak <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "re"), 
                            data = peak_spawning)
 appraise(spawning_model_peak)
 summary(spawning_model_peak)
 gam.check(spawning_model_peak)
-draw(spawning_model_peak, residuals = T,)
-#ggsave("./figures/spawning_peak.jpeg", height = 7, width = 6)
+draw(spawning_model_peak, residuals = T)
 
 
 start_spawning <- filtered_phenology %>% filter(event == "start")
@@ -50,7 +50,6 @@ spawning_model_start <- gam(julian_day ~ s(ice_off_anomaly) + s(location, bs = "
                             data = start_spawning)
 appraise(spawning_model_start)
 draw(spawning_model_start, residuals = T, select = 1)
-#ggsave("./figures/spawning_start.jpeg", height = 7, width = 6)
 summary(spawning_model_start)
 
 
@@ -142,70 +141,16 @@ timing.cis.plot <- timing.cis %>%
          jit = ifelse(timing == "Early Difference", -0.15, jit),
          axis.label = as.factor(ifelse(group == "peak", "Spawning Peak", "Spawning Start")))
 
-#write.csv(timing.cis.plot, "./data/wae_spawning_modeled.csv", row.names = F)
+write.csv(timing.cis.plot, "./data/wae_spawning_modeled.csv", row.names = F)
+```
 
 
-timing.cis.plot %>%
-  filter(!grepl("Difference", timing)) %>%
-  mutate(numeric = ifelse(numeric == 2, 1.5, numeric)) %>%
-  ggplot() + 
-  geom_point(aes(x = median, y = (numeric + jit), color = timing), size = 2) + 
-  geom_segment(aes(y = (numeric + jit), yend = (numeric + jit), 
-                   x = lower.95, xend = upper.95, color = timing)) +
-  geom_segment(aes(y = (numeric + jit), yend = (numeric + jit), 
-                   x = lower.75, xend = upper.75, color = timing), linewidth = 1.5) +
-  theme_classic() +
-  labs(y = "",
-       x = "Julian Day Peak Spawning Occurs", color = "Ice-off Anomaly") +
-  theme(panel.grid.major.x = element_line(),
-        panel.grid.minor.x = element_line(),
-        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
-        plot.title = element_text(angle = 0, size = 14, face = 2),
-        strip.placement = "outside",
-        strip.background = element_blank(),
-        axis.text.y = element_text(size = 14),
-        axis.text.x = element_text(size = 14),
-        axis.title.x = element_text(size = 16),
-        legend.title = element_text(size = 14), 
-        legend.text = element_text(size = 12)
-        ) +
-  scale_color_manual(values = c("#0000FF", "#000000", "#FF0000")) +
-  scale_y_continuous(breaks = c(1, 1.5), labels = levels(timing.cis.plot$axis.label)) +
-  scale_x_continuous(breaks = seq(100, 135, by = 15))
+```{r}
+pred.df.spawn = data.frame(
+  ice_off_anomaly = c(early.anomaly, 0, late.anomaly),
+  location = "Green")
 
-#ggsave("./figures/peak_density_zoop.jpeg", height = 8, width = 8)
-
-
-timing.cis.plot %>%
-  filter(grepl("Difference", timing)) %>%
-  mutate(numeric = ifelse(numeric == 2, 1.2, numeric)) %>%
-  ggplot() + 
-  geom_point(aes(x = median, y = (numeric)), size = 2) + 
-  geom_segment(aes(y = (numeric ), yend = (numeric), 
-                   x = lower.95, xend = upper.95)) +
-  geom_segment(aes(y = (numeric), yend = (numeric), 
-                   x = lower.75, xend = upper.75), linewidth = 1.5) +
-  geom_vline(xintercept = c(0), linetype = "dotted") +
-  #facet_grid(group ~., switch = "y") +
-  theme_classic() +
-  labs(y = "",
-       x = "Difference in peak timing from early and late anomaly") +
-  theme(panel.grid.major.x = element_line(),
-        panel.grid.minor.x = element_line(),
-        strip.text.y.left = element_text(angle = 0, size = 12, face = 2),
-        plot.title = element_text(angle = 0, size = 14, face = 2),
-        strip.placement = "outside",
-        strip.background = element_blank(),
-        axis.text.y = element_text(size = 14),
-        axis.text.x = element_text(size = 14),
-        axis.title.x = element_text(size = 16),
-        legend.title = element_text(size = 14), 
-        legend.text = element_text(size = 12)
-        ) +
-  scale_y_continuous(breaks = c(1, 1.2), labels = levels(timing.cis.plot$axis.label)) +
-  scale_x_continuous(breaks = seq(-20, 15, by = 5))
-
-#ggsave("./figures/spawning_diff_wae.jpeg", height = 2, width = 8)
+pred.df.spawn$predictions <- predict(spawning_model_peak, newdata = pred.df.spawn)
 ```
 
 
